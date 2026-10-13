@@ -1,0 +1,219 @@
+import { describe, expect, it } from 'vitest';
+
+import { createToolMaps } from '../../src/tools/names.js';
+import { parseToolCallsFromText, rawDecodeJson } from '../../src/tools/parse.js';
+import type { ToolDefinition } from '../../src/types/message.js';
+
+const CODEBUDDY_TOOLS: ToolDefinition[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'read_file',
+      parameters: { properties: { filePath: {} } },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'write_to_file',
+      parameters: { properties: { filePath: {}, content: {} } },
+    },
+  },
+];
+const MAPS = createToolMaps(CODEBUDDY_TOOLS);
+
+function argsOf(tc: { function: { arguments: string } }): Record<string, unknown> {
+  return JSON.parse(tc.function.arguments) as Record<string, unknown>;
+}
+
+describe('rawDecodeJson', () => {
+  it('解析从 0 开始的第一个完整 JSON 对象并给出结束位置', () => {
+    const text = '{"a":1} 后面还有内容';
+    const out = rawDecodeJson(text);
+    expect(out?.value).toEqual({ a: 1 });
+    expect(out?.end).toBe(7);
+  });
+
+  it('正确跨越字符串里的 } 与转义引号', () => {
+    const text = '{"a":"} not end \\" still inside"}tail';
+    const out = rawDecodeJson(text);
+    expect(out?.value).toEqual({ a: '} not end " still inside' });
+    expect(text.slice(out?.end)).toBe('tail');
+  });
+
+  it('处理嵌套对象', () => {
+    const text = '{"a":{"b":{"c":1}}}x';
+    const out = rawDecodeJson(text);
+    expect(out?.value).toEqual({ a: { b: { c: 1 } } });
+    expect(text.slice(out?.end)).toBe('x');
+  });
+
+  it('括号不闭合时返回 undefined', () => {
+    expect(rawDecodeJson('{"a":1')).toBeUndefined();
+  });
+
+  it('不是对象/数组时返回 undefined', () => {
+    expect(rawDecodeJson('hello')).toBeUndefined();
+    expect(rawDecodeJson('')).toBeUndefined();
+  });
+
+  it('跳过前导空白', () => {
+    expect(rawDecodeJson('   {"a":1}')?.end).toBe(10);
+  });
+});
+
+describe('parseToolCallsFromText — Pattern 1（标准格式）', () => {
+  it('提取调用并把块从正文里移除', () => {
+    const text =
+      '我先读文件\n<tool_call>\n{"name":"Read","arguments":{"file_path":"/a.ts"}}\n</tool_call>\n完成';
+    const out = parseToolCallsFromText(text);
+
+    expect(out.toolCalls).toHaveLength(1);
+    expect(out.toolCalls[0]?.function.name).toBe('Read');
+    expect(argsOf(out.toolCalls[0]!)).toEqual({ file_path: '/a.ts' });
+    expect(out.text).toBe('我先读文件\n\n完成');
+  });
+
+  it('传入 maps 时映射到客户端真实工具名与参数名', () => {
+    const text = '<tool_call>{"name":"Read","arguments":{"file_path":"/a.ts"}}</tool_call>';
+    const out = parseToolCallsFromText(text, MAPS);
+
+    expect(out.toolCalls[0]?.function.name).toBe('read_file');
+    expect(argsOf(out.toolCalls[0]!)).toEqual({ filePath: '/a.ts' });
+  });
+
+  it('多个块全部提取', () => {
+    const text =
+      '<tool_call>{"name":"Read","arguments":{"file_path":"/a.ts"}}</tool_call>' +
+      '中间文字' +
+      '<tool_call>{"name":"Read","arguments":{"file_path":"/b.ts"}}</tool_call>';
+    const out = parseToolCallsFromText(text);
+
+    expect(out.toolCalls).toHaveLength(2);
+    expect(out.text).toBe('中间文字');
+  });
+
+  it('空块被忽略并清理掉标签', () => {
+    const out = parseToolCallsFromText('正文<tool_call>\n\n</tool_call>');
+    expect(out.toolCalls).toHaveLength(0);
+    expect(out.text).toBe('正文');
+  });
+
+  it('没有工具调用时正文原样返回', () => {
+    const out = parseToolCallsFromText('就是一段普通回答');
+    expect(out.toolCalls).toHaveLength(0);
+    expect(out.text).toBe('就是一段普通回答');
+  });
+});
+
+describe('parseToolCallsFromText — 宽容格式', () => {
+  it('Pattern 2：name 写成 XML 属性', () => {
+    const text = '<tool_call name="Read">{"path":"/a.ts"}</tool_call';
+    const out = parseToolCallsFromText(text);
+    expect(out.toolCalls[0]?.function.name).toBe('Read');
+    expect(argsOf(out.toolCalls[0]!)).toEqual({ file_path: '/a.ts' });
+  });
+
+  it('Pattern 3：JSON 在前、闭合标签残缺', () => {
+    const text = '{"name":"Read","arguments":{"file_path":"/a.ts"}}</tool_call';
+    const out = parseToolCallsFromText(text);
+    expect(out.toolCalls).toHaveLength(1);
+    expect(out.text).toBe('');
+  });
+
+  it('Pattern 4：少了开头的 <', () => {
+    const text = 'tool_call>{"name":"Read","arguments":{"file_path":"/a.ts"}}</tool_call>';
+    const out = parseToolCallsFromText(text);
+    expect(out.toolCalls).toHaveLength(1);
+  });
+
+  it('Pattern 5：完全没有闭合标签（靠 raw_decode 定界）', () => {
+    const text =
+      'tool_call>\n{"name":"Write","arguments":{"file_path":"/a.ts","content":"x"}}\n后面还有文字';
+    const out = parseToolCallsFromText(text);
+    expect(out.toolCalls).toHaveLength(1);
+    expect(out.text).toBe('后面还有文字');
+  });
+
+  it('破碎标签 <ttool_call> 会被归一化后解析', () => {
+    const text = '<ttool_call>\n{"name":"Read","arguments":{"file_path":"/a.ts"}}\n</ttool_call>';
+    const out = parseToolCallsFromText(text);
+    expect(out.toolCalls).toHaveLength(1);
+    expect(out.text).toBe('');
+  });
+
+  it('Pattern 6：标签全碎时从正文里扫独立 JSON', () => {
+    const text = 'tool_call 标签碎了\n{"name":"Read","arguments":{"file_path":"/a.ts"}}';
+    const out = parseToolCallsFromText(text);
+    expect(out.toolCalls).toHaveLength(1);
+    expect(argsOf(out.toolCalls[0]!)).toEqual({ file_path: '/a.ts' });
+  });
+
+  it('没有破碎标签迹象时不启用 Pattern 6（避免误吃正常 JSON 代码示例）', () => {
+    const text = '这是配置示例：\n{"name":"Read","arguments":{"file_path":"/a.ts"}}';
+    const out = parseToolCallsFromText(text);
+    expect(out.toolCalls).toHaveLength(0);
+    expect(out.text).toBe(text);
+  });
+});
+
+describe('parseToolCallsFromText — Pattern 7（DOM 损坏修复）', () => {
+  it('预览 key 损坏的 JSON 会被修复并提取', () => {
+    const text =
+      '<tool_call>\n{"file_path"file_path": "/opt/proj/src/index.ts", "nam"name": "Read"}\n</tool_call>';
+    const out = parseToolCallsFromText(text);
+
+    expect(out.toolCalls).toHaveLength(1);
+    expect(out.toolCalls[0]?.function.name).toBe('Read');
+    expect(argsOf(out.toolCalls[0]!)).toEqual({ file_path: '/opt/proj/src/index.ts' });
+    expect(out.text).toBe('');
+  });
+
+  it('修复后仍走 maps 映射到客户端真实工具名', () => {
+    const text =
+      '<tool_call>\n{"file_path"file_path": "/opt/proj/index.ts", "nam"name": "Read"}\n</tool_call>';
+    const out = parseToolCallsFromText(text, MAPS);
+    expect(out.toolCalls[0]?.function.name).toBe('read_file');
+  });
+});
+
+describe('parseToolCallsFromText — 边界', () => {
+  it('空字符串安全', () => {
+    expect(parseToolCallsFromText('')).toEqual({ text: '', toolCalls: [] });
+  });
+
+  it('顶层不是 name/arguments 的 JSON 不会被当成工具调用', () => {
+    const text = 'tool_call>\n{"foo":"bar"}';
+    const out = parseToolCallsFromText(text);
+    expect(out.toolCalls).toHaveLength(0);
+  });
+
+  it('工具名缺失但能按参数推断时，Pattern 7 会补成 Read（与 Python 版一致）', () => {
+    // Pattern 7 的兜底：有 path 类参数但完全没有 name → 默认 Read（最常见的只读操作）
+    const text = '<tool_call>{"arguments":{"file_path":"/a.ts"}}</tool_call>';
+    const out = parseToolCallsFromText(text);
+    expect(out.toolCalls).toHaveLength(1);
+    expect(out.toolCalls[0]?.function.name).toBe('Read');
+  });
+
+  it('工具名与参数都无法推断时不产生调用', () => {
+    const text = 'tool_call>\n{"arguments":{"foo":"bar"}}';
+    const out = parseToolCallsFromText(text);
+    expect(out.toolCalls).toHaveLength(0);
+  });
+
+  it('同一段文本不会重复提取（span 去重）', () => {
+    // Pattern 1 命中后，Pattern 4 的同区间应被跳过
+    const text = '<tool_call>{"name":"Read","arguments":{"file_path":"/a.ts"}}</tool_call>';
+    const out = parseToolCallsFromText(text);
+    expect(out.toolCalls).toHaveLength(1);
+  });
+
+  it('正文里的工具调用标签残留会被清干净', () => {
+    const text =
+      '开始\n<tool_call>{"name":"Read","arguments":{"file_path":"/a.ts"}}</tool_call>\n结束';
+    const out = parseToolCallsFromText(text);
+    expect(out.text).not.toContain('tool_call');
+    expect(out.text).toBe('开始\n\n结束');
+  });
+});

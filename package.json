@@ -1,0 +1,60 @@
+{
+  "name": "webaiapi",
+  "version": "0.1.0",
+  "description": "把国产 AI 聊天网页（ChatGLM）包装成 OpenAI 兼容 API —— Playwright Firefox 纯浏览器自动化。命令名：wbai",
+  "keywords": [
+    "openai",
+    "api-gateway",
+    "chatglm",
+    "playwright",
+    "browser-automation",
+    "llm",
+    "cli",
+    "wbai"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "bin": {
+    "wbai": "./bin/wbai.mjs"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "bin",
+    "README.md",
+    "postinstall.mjs"
+  ],
+  "scripts": {
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js start",
+    "build": "tsc -p tsconfig.json && node -e \"require('node:fs').chmodSync('dist/cli.js', 0o755)\"",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run typecheck && npm run test",
+    "postinstall": "node postinstall.mjs",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "fastify": "^5.12.5",
+    "pino": "^10.4.0",
+    "playwright": "^1.64.0",
+    "zod": "^4.6.6"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.4"
+  }
+}
