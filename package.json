@@ -18,7 +18,7 @@
     "node": ">=20.11"
   },
   "bin": {
-    "wbai": "./bin/wbai.mjs"
+    "wbai": "bin/wbai.mjs"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
