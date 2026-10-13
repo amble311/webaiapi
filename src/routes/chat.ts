@@ -51,6 +51,7 @@ import { filterPlaceholderToolCalls } from '../tools/placeholder.js';
 import {
   createToolMaps,
   filterUnknownToolCalls,
+  repairToolCallBySignature,
   type ToolMaps,
 } from '../tools/names.js';
 import {
@@ -929,6 +930,16 @@ export async function parseAndRecoverToolCalls(params: {
         // 过滤器同样要走一遍：编造的工具名/占位符不能下发
         if (contTcs.length > 0) contTcs = filterPlaceholderToolCalls(contTcs).valid;
         if (contTcs.length > 0) contTcs = filterUnknownToolCalls(contTcs, tools).valid;
+        if (contTcs.length > 0) {
+          const { repaired, reroutes } = repairToolCallBySignature(contTcs, tools);
+          contTcs = repaired;
+          for (const r of reroutes) {
+            logger.warn(
+              `[tool_calls] 按参数签名改派工具: ${r.from} → ${r.to}` +
+                `（未知参数 ${r.unknownKeys.join(', ')}）`,
+            );
+          }
+        }
 
         if (contTcs.length > 0) {
           parsedToolCalls = contTcs;
@@ -1029,6 +1040,20 @@ export async function parseAndRecoverToolCalls(params: {
   if (parsedToolCalls.length > 0) {
     // 未知工具名过滤：AI 编造的工具名（如 "工具名称"）客户端无法执行
     parsedToolCalls = filterUnknownToolCalls(parsedToolCalls, tools).valid;
+  }
+  if (parsedToolCalls.length > 0) {
+    /* 按参数签名纠正选错的工具：模型想创建文件却调 edit_file 并套用
+     * write_file 的签名（实测：edit_file(path, content)）—— 客户端会拒收
+     * 「未知参数 content」。若恰好只有一个已声明工具的签名装得下这些参数
+     * （write_file），就改派过去，省掉一轮注定失败的往返。 */
+    const { repaired, reroutes } = repairToolCallBySignature(parsedToolCalls, tools);
+    parsedToolCalls = repaired;
+    for (const r of reroutes) {
+      logger.warn(
+        `[tool_calls] 按参数签名改派工具: ${r.from} → ${r.to}` +
+          `（未知参数 ${r.unknownKeys.join(', ')}）`,
+      );
+    }
   }
 
   if (beforeFilter > 0 && parsedToolCalls.length === 0 && fullResponse) {

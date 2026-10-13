@@ -14,7 +14,7 @@ import { randomUUID } from 'node:crypto';
 
 import { logger } from '../log/logger.js';
 import type { ToolCallPayload, ToolDefinition } from '../types/message.js';
-import { toolNameOf } from '../types/message.js';
+import { toolNameOf, toolRequiredParams } from '../types/message.js';
 import { cleanDomHtml } from './clean.js';
 
 /** AI 输出工具名 → 标准名的静态别名表。 */
@@ -382,4 +382,148 @@ export function filterUnknownToolCalls(
   }
 
   return { valid, dropped };
+}
+
+/* ==================================================================== */
+/* 按参数签名纠正选错的工具                                             */
+/* ==================================================================== */
+
+/** 一个工具声明的「参数面」（用于判断一组参数是否落在它的签名里）。 */
+interface ParamSurface {
+  name: string;
+  /** 声明的全部参数名。 */
+  props: ReadonlySet<string>;
+  /** 声明的必填参数名。 */
+  required: ReadonlySet<string>;
+}
+
+function paramSurfaceOf(tool: ToolDefinition): ParamSurface | null {
+  const name = toolNameOf(tool);
+  if (!name) return null;
+
+  const props = Object.keys(tool?.function?.parameters?.properties ?? {});
+  // 没声明参数面的工具（或声明成空对象）无法参与判断 —— 跳过，别瞎猜
+  if (props.length === 0) return null;
+
+  return {
+    name,
+    props: new Set(props),
+    required: new Set(toolRequiredParams(tool)),
+  };
+}
+
+/** 解析 `arguments`（OpenAI 形态是 JSON 字符串）；解析失败返回 null。 */
+function parseArgs(tc: ToolCallPayload): Record<string, unknown> | null {
+  const raw = tc.function?.arguments;
+  if (!raw) return null;
+  if (typeof raw === 'object') return raw as Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+export interface SignatureReroute {
+  from: string;
+  to: string;
+  /** 触发改派的多余参数名（诊断用）。 */
+  unknownKeys: string[];
+}
+
+/**
+ * 按「参数签名」纠正选错的工具。
+ *
+ * ## 解决的真实问题（2026-10-14，xzh 实测）
+ * 模型想**创建**文件，却调了 `edit_file` 并套用 `write_file` 的签名
+ * （`edit_file(path, content)`）。客户端校验签名直接拒收：
+ * `edit_file 收到未知参数 "content"。可用参数："path"、"search"、"replace"`。
+ * 模型虽然能在下一轮思考里自我纠正（日志里它自己说
+ * "I used the wrong tool — edit_file needs path/search/replace, not content"），
+ * 但那一轮已经烧掉了客户端的一次工具往返，用户看到的就是一条报错。
+ *
+ * ## 规则（**保守**：只在能确定时动手）
+ * 对每个调用：
+ * 1. 按名字找到声明的工具；它的签名**装得下**全部参数 → 原样保留；
+ * 2. 装不下（存在未知参数）→ 在**其余**声明工具里找「能装下全部参数、
+ *    且必填参数都被满足」的候选：
+ *    - 恰好 **1 个** → 改派给它（`edit_file(path,content)` → `write_file`）；
+ *    - 0 个或 ≥2 个 → **原样保留**。0 个说明没有更好的去处；≥2 个说明有歧义，
+ *      猜错比让客户端拒绝更糟（可能改写到错误的文件）。
+ * 3. 名字本身就不在声明列表里的调用**不碰**（那是 {@link filterUnknownToolCalls} 的职责）。
+ *
+ * @returns 修好的调用数组 + 改派记录（调用方负责打日志）
+ */
+export function repairToolCallBySignature(
+  toolCalls: ReadonlyArray<ToolCallPayload> | null | undefined,
+  tools: ReadonlyArray<ToolDefinition> | null | undefined,
+): { repaired: ToolCallPayload[]; reroutes: SignatureReroute[] } {
+  if (!toolCalls || toolCalls.length === 0) return { repaired: [], reroutes: [] };
+  if (!tools || tools.length === 0) return { repaired: [...toolCalls], reroutes: [] };
+
+  const surfaces: ParamSurface[] = [];
+  for (const t of tools) {
+    const s = paramSurfaceOf(t);
+    if (s) surfaces.push(s);
+  }
+  // 连参数面都拿不到 → 无法判断，全部放行
+  if (surfaces.length === 0) return { repaired: [...toolCalls], reroutes: [] };
+
+  const byName = new Map<string, ParamSurface>();
+  for (const s of surfaces) byName.set(s.name, s);
+
+  const repaired: ToolCallPayload[] = [];
+  const reroutes: SignatureReroute[] = [];
+
+  for (const tc of toolCalls) {
+    const name = tc.function?.name ?? '';
+    const declared = byName.get(name);
+
+    // 名字未知，或声明工具没有参数面 → 不归本函数管
+    if (!declared) {
+      repaired.push(tc);
+      continue;
+    }
+
+    const args = parseArgs(tc);
+    if (!args) {
+      repaired.push(tc);
+      continue;
+    }
+
+    const keys = Object.keys(args);
+    const unknownKeys = keys.filter((k) => !declared.props.has(k));
+
+    // 签名装得下 → 不动
+    if (unknownKeys.length === 0) {
+      repaired.push(tc);
+      continue;
+    }
+
+    // 找「能装下全部参数、且必填都被满足」的其它工具
+    const candidates = surfaces.filter(
+      (s) =>
+        s.name !== declared.name &&
+        keys.every((k) => s.props.has(k)) &&
+        [...s.required].every((r) => keys.includes(r)),
+    );
+
+    if (candidates.length === 1) {
+      const target = candidates[0] as ParamSurface;
+      reroutes.push({ from: name, to: target.name, unknownKeys });
+      repaired.push({
+        ...tc,
+        function: { ...tc.function, name: target.name, arguments: JSON.stringify(args) },
+      });
+      continue;
+    }
+
+    // 0 个（没有更好的去处）或 ≥2 个（有歧义）→ 原样交给客户端裁决
+    repaired.push(tc);
+  }
+
+  return { repaired, reroutes };
 }

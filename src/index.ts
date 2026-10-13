@@ -93,9 +93,10 @@ export {
   normalizeParamKey,
   normalizeToolArguments,
   normalizeToolName,
+  repairToolCallBySignature,
   resolveToolName,
 } from './tools/names.js';
-export type { ToolMaps } from './tools/names.js';
+export type { SignatureReroute, ToolMaps } from './tools/names.js';
 
 export { buildToolCall } from './tools/build.js';
 
