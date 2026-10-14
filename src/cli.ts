@@ -5,13 +5,13 @@
  *
  * 用法：
  * ```
- * wbai start                     启动服务（前台阻塞）
- * wbai status                    查看运行状态（账号 / 辅助通道 / 请求池）
- * wbai accounts                  只看账号与角色
- * wbai health                    健康检查
- * wbai login chatglm [--account x]  交互式登录并捕获凭证
- * wbai logout chatglm [--account x] 删除某账号的凭证
- * wbai --help
+ * webapi start                     启动服务（前台阻塞）
+ * webapi status                    查看运行状态（账号 / 辅助通道 / 请求池）
+ * webapi accounts                  只看账号与角色
+ * webapi health                    健康检查
+ * webapi login chatglm [--account x]  交互式登录并捕获凭证
+ * webapi logout chatglm [--account x] 删除某账号的凭证
+ * webapi --help
  * ```
  *
  * ## 为什么用 CLI 而不是 shell 脚本
@@ -96,24 +96,25 @@ export function helpText(): string {
   }).join('\n');
 
   return `
-wbai —— 把国产 AI 聊天网页包装成 OpenAI 兼容接口
+webapi —— 把国产 AI 聊天网页包装成 OpenAI 兼容接口
 
 用法:
-  wbai login [<platform>] [--account <id>]   登录并捕获凭证（可多账号，交互式选择）
-  wbai logout [<platform>] [--account <id>]   删除某账号的凭证（交互式选择）
-  wbai accounts                               账号与角色（多账号是否生效的权威视图）
-  wbai status                                 运行状态（模型路由 / 辅助通道 / 请求池）
-  wbai health                                 健康检查（各平台登录状态）
-  wbai doctor                                 自检（Node / Firefox / 凭证 / 端口）
-  wbai start                                  启动服务（前台运行，Ctrl-C 退出）
-  wbai --help
+  webapi login [<platform>] [--account <id>]   登录并捕获凭证（可多账号，交互式选择）
+  webapi logout [<platform>] [--account <id>]   删除某账号的凭证（交互式选择）
+  webapi accounts                               账号与角色（多账号是否生效的权威视图）
+  webapi status                                 运行状态（模型路由 / 辅助通道 / 请求池）
+  webapi health                                 健康检查（各平台登录状态）
+  webapi doctor                                 自检（Node / Firefox / 凭证 / 端口）
+  webapi start                                  启动服务（前台运行，Ctrl-C 退出）
+  webapi --help
+  webapi --version
 
 平台（login / logout 不给参数时会让你选）:
 ${platformLines}
 
 首次使用（两步）:
   1. npx playwright install firefox    下载浏览器（约 80MB，只需一次）
-  2. wbai login                         选平台 → 登录并捕获凭证（会打开可见浏览器）
+  2. webapi login                         选平台 → 登录并捕获凭证（会打开可见浏览器）
 
 多账号:
   同一平台登录第二个账号即可启用「辅助通道」—— 历史压缩与工具调用转换
@@ -121,7 +122,7 @@ ${platformLines}
   账号名会从登录身份自动派生（用户名 → uid），不用自己想。
   ⚠️ 两个账号必须是不同的人：抓到的身份与 Cookie 都会被校验，重复了会拦下来。
 
-  非交互（脚本 / CI）: wbai login chatglm --account acc2 --yes
+  非交互（脚本 / CI）: webapi login chatglm --account acc2 --yes
 
 环境变量（可用 .env）:
   API_HOST / API_PORT      监听地址与端口（默认 ${settings.apiHost}:${settings.apiPort}）
@@ -185,7 +186,7 @@ function renderAccounts(payload: Record<string, unknown>): string[] {
 
   const platforms = Object.keys(accounts);
   if (platforms.length === 0) {
-    lines.push('（未发现任何凭证：请先运行 `wbai login chatglm`）');
+    lines.push('（未发现任何凭证：请先运行 `webapi login chatglm`）');
     return lines;
   }
 
@@ -222,7 +223,7 @@ async function cmdStatus(): Promise<number> {
   if (!payload) {
     console.error(
       `无法连接服务（http://${settings.apiHost}:${settings.apiPort}${settings.apiPrefix}）。` +
-        '请先运行 `wbai start`。',
+        '请先运行 `webapi start`。',
     );
     return 1;
   }
@@ -244,7 +245,7 @@ async function cmdStatus(): Promise<number> {
 async function cmdAccounts(): Promise<number> {
   const payload = await fetchJson('/status');
   if (!payload) {
-    console.error('无法连接服务，请先运行 `wbai start`。');
+    console.error('无法连接服务，请先运行 `webapi start`。');
     return 1;
   }
   console.log(renderAccounts(payload).join('\n'));
@@ -348,11 +349,11 @@ async function cmdDoctor(): Promise<number> {
     ok(`${platform}: ${detail}`);
   }
   if (totalAccounts === 0) {
-    bad('没有任何凭证（等于没登录，平台会一直回「请求过于频繁」）', 'wbai login chatglm');
+    bad('没有任何凭证（等于没登录，平台会一直回「请求过于频繁」）', 'webapi login chatglm');
   } else if (totalAccounts === 1) {
     warn(
       '只有 1 个账号 → 辅助通道不会启用，压缩/转换与主对话串行（功能正常，只是慢一些）',
-      '再加一个账号：wbai login chatglm --account acc2',
+      '再加一个账号：webapi login chatglm --account acc2',
     );
   }
 
@@ -362,7 +363,7 @@ async function cmdDoctor(): Promise<number> {
   //    「正在跑但探测很慢」误报成「没在跑」。
   const alive = await fetchJson('/status', 6000);
   if (!alive) {
-    console.log('  ℹ️  服务未在运行（正常，如果你还没 wbai start）');
+    console.log('  ℹ️  服务未在运行（正常，如果你还没 webapi start）');
   } else {
     ok(`服务在跑: http://${settings.apiHost}:${settings.apiPort}${settings.apiPrefix}`);
     console.log('  正在检查登录状态（会启动浏览器，请稍候）...');
@@ -370,14 +371,14 @@ async function cmdDoctor(): Promise<number> {
     const providers = (health?.['providers'] ?? {}) as Record<string, Record<string, string>>;
     for (const [name, info] of Object.entries(providers)) {
       if (info['status'] === 'connected') ok(`${name}: connected`);
-      else warn(`${name}: ${info['status']}`, 'wbai login chatglm');
+      else warn(`${name}: ${info['status']}`, 'webapi login chatglm');
     }
-    if (!health) warn('登录状态查询超时（服务本身正常）', 'wbai health 可单独重试');
+    if (!health) warn('登录状态查询超时（服务本身正常）', 'webapi health 可单独重试');
   }
 
   console.log('');
   if (problems === 0) {
-    console.log('自检通过 ✅  下一步: wbai start\n');
+    console.log('自检通过 ✅  下一步: webapi start\n');
     return 0;
   }
   console.log(`发现 ${problems} 个必须解决的问题（见上方 ❌）\n`);
@@ -391,12 +392,27 @@ async function cmdDoctor(): Promise<number> {
 export async function runCli(argv: ReadonlyArray<string> = process.argv): Promise<number> {
   const { command, positional, flags } = parseArgs(argv);
 
+  /* `webapi --version` / `-v`：发布后校验要用它（见 release 技能第 8 步）。
+   * ⚠️ `parseArgs` 会把 `--xxx` 收进 `flags`（`--help` 也因此变成 command='help'），
+   *    所以这里必须在 switch **之前**判 flags。 */
+  if (flags['version'] || flags['v']) {
+    const { settings } = await import('./config.js');
+    console.log(settings.appVersion);
+    return 0;
+  }
+
   switch (command) {
     case 'help':
     case '--help':
     case '-h':
       console.log(helpText());
       return 0;
+
+    case 'version': {
+      const { settings } = await import('./config.js');
+      console.log(settings.appVersion);
+      return 0;
+    }
 
     case 'start': {
       const { startServer } = await import('./server/app.js');
@@ -452,7 +468,7 @@ export async function runCli(argv: ReadonlyArray<string> = process.argv): Promis
  * 本模块是否被**直接执行**（而不是被 import）。
  *
  * ⚠️ 不能用 `argv[1].endsWith('cli.js')` 这种写法：npm 安装后 bin 是**符号链接**
- * （`node_modules/.bin/wbai` → `../webaiapi/dist/cli.js`），而 Node 的
+ * （`node_modules/.bin/webapi` → `../webaiapi/dist/cli.js`），而 Node 的
  * `process.argv[1]` 是**未经 realpath 解析**的路径 —— 名字对不上，
  * CLI 会静默什么都不做（最难查的一类"装好了但没反应"）。
  * 这里对两边都做 realpath 再比。

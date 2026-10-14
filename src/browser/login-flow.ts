@@ -1,5 +1,5 @@
 /**
- * 交互式登录 / 退出编排（`wbai login` / `wbai logout`）。
+ * 交互式登录 / 退出编排（`webapi login` / `webapi logout`）。
  *
  * ## 与 `auth-capture.ts` 的分工
  * - `auth-capture.ts` —— **机制**：开浏览器、抓 cookie/bearer、原子落盘。它不知道
@@ -9,7 +9,7 @@
  * ## 它解决的两个真问题
  *
  * ### 1. 多账号「怎么命名」
- * 旧流程要求用户**自己**想账号名（`wbai login chatglm --account acc2`），
+ * 旧流程要求用户**自己**想账号名（`webapi login chatglm --account acc2`），
  * 于是出现了大量 `acc2` / `test` / `a` 这种名字 —— 过两周没人记得谁是谁。
  * 现在：捕获完直接**用平台返回的身份**（用户名）派生账号名，
  * 用户只需在确有歧义时确认一下。
@@ -286,7 +286,7 @@ async function confirmOrSkip(
 /* ==================================================================== */
 
 export interface LoginOptions {
-  /** `wbai login <platform>`；缺省时交互选择。 */
+  /** `webapi login <platform>`；缺省时交互选择。 */
   platform?: string;
   /** `--account <id>`：跳过「存成哪个账号」的询问。 */
   account?: string;
@@ -315,7 +315,7 @@ const ABORT = Symbol('abort');
 type NavChoice = typeof BACK | typeof ABORT;
 
 /**
- * `wbai login` 的完整流程。
+ * `webapi login` 的完整流程。
  *
  * ## 导航模型
  * 交互式登录是**两级**的（选平台 → 选动作），所以用一个小循环 + 显式哨兵
@@ -327,7 +327,7 @@ type NavChoice = typeof BACK | typeof ABORT;
  *      └──── 「← 返回上一步」─┘
  * ```
  *
- * ⚠️ **只从平台菜单进来的才有「上一步」**：`wbai login chatglm` 是用户在命令行
+ * ⚠️ **只从平台菜单进来的才有「上一步」**：`webapi login chatglm` 是用户在命令行
  * 明确指定的平台，没有可返回的地方，那里给的是「✗ 取消」。
  *
  * ⚠️ 动作菜单**即使 0 个账号也照样显示**（此时只有「添加新账号」+ 返回/取消）。
@@ -348,7 +348,7 @@ export async function runLogin(options: LoginOptions = {}): Promise<number> {
     if (!platform) {
       if (!interactive) {
         console.error(
-          '非交互环境必须指定平台：wbai login <platform>\n' +
+          '非交互环境必须指定平台：webapi login <platform>\n' +
             `可用平台: ${PLATFORM_LIST.map((s) => s.id).join(', ')}`,
         );
         return 1;
@@ -605,14 +605,14 @@ async function loginOnPlatform(ctx: {
     console.log('');
     console.log(
       `  提示: 只有 1 个账号时，压缩/转换会与主对话**串行**（功能正常，只是慢）。\n` +
-        `        想并行再加一个账号: wbai login ${platform} --account acc2`,
+        `        想并行再加一个账号: webapi login ${platform} --account acc2`,
     );
   }
 
   console.log('');
   console.log('下一步:');
-  console.log(`  ${dim('wbai accounts       查看账号与角色分配')}`);
-  console.log(`  ${dim('wbai start          启动服务')}`);
+  console.log(`  ${dim('webapi accounts       查看账号与角色分配')}`);
+  console.log(`  ${dim('webapi start          启动服务')}`);
   console.log(`  ${dim('（服务正在运行的话，重启它或等 30s 让辅助通道重扫）')}`);
 
   return 0;
@@ -623,7 +623,7 @@ async function loginOnPlatform(ctx: {
 /* ==================================================================== */
 
 export interface LogoutOptions {
-  /** `wbai logout <platform>`；缺省时交互选择。 */
+  /** `webapi logout <platform>`；缺省时交互选择。 */
   platform?: string;
   /** `--account <id>`：跳过账号询问。 */
   account?: string;
@@ -634,11 +634,11 @@ export interface LogoutOptions {
 }
 
 /**
- * `wbai logout` 的完整流程。
+ * `webapi logout` 的完整流程。
  *
  * ## ⚠️ 这里修掉了一个**会静默删错文件**的老问题
- * 旧实现是 `wbai logout <platform> [--account x]`，`account` 缺省值写死为
- * `'default'`。于是 `wbai logout chatglm`（本意可能只是「看看怎么用」）
+ * 旧实现是 `webapi logout <platform> [--account x]`，`account` 缺省值写死为
+ * `'default'`。于是 `webapi logout chatglm`（本意可能只是「看看怎么用」）
  * **直接把 default 账号的凭证删掉了**，而且只在 stdout 说一句「已删除」。
  *
  * 现在：账号必须**显式给出**（`--account`）或**从菜单里选**；
@@ -657,7 +657,7 @@ export async function runLogout(options: LogoutOptions = {}): Promise<number> {
     /* ---------------- 1. 选定平台 ---------------- */
     if (!platform) {
       if (!interactive) {
-        console.error('非交互环境必须指定平台：wbai logout <platform> --account <id> --yes');
+        console.error('非交互环境必须指定平台：webapi logout <platform> --account <id> --yes');
         return 1;
       }
 
@@ -700,7 +700,7 @@ export async function runLogout(options: LogoutOptions = {}): Promise<number> {
     if (!account) {
       if (!interactive) {
         console.error(
-          `非交互环境必须明确指定账号：wbai logout ${platform} --account <id> --yes\n` +
+          `非交互环境必须明确指定账号：webapi logout ${platform} --account <id> --yes\n` +
             `现有账号: ${ids.join(', ')}`,
         );
         return 1;
@@ -797,7 +797,7 @@ async function deleteAccount(ctx: {
   console.log(
     remaining.length > 0
       ? `  剩余账号: ${remaining.join(', ')}`
-      : `  该平台已无账号。再登录: wbai login ${platform}`,
+      : `  该平台已无账号。再登录: webapi login ${platform}`,
   );
   console.log('');
   console.log('（服务正在运行的话，重启它或等 30s 让辅助通道重扫才会生效）');

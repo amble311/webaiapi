@@ -45,13 +45,14 @@ import { getLastRawSse } from '../providers/chatglm-sse.js';
 import type { ChatRequest } from '../providers/base.js';
 import { formatMessagesAsText, formatToolsAsText } from '../tools/protocol.js';
 import { parseToolCallsFromText } from '../tools/parse.js';
-import { buildReparsePrompt } from '../tools/prompts.js';
+import { buildActionRecoveryPrompt } from '../tools/prompts.js';
 import { directConvertToToolCalls, convertTextToToolCalls } from '../tools/convert.js';
 import { filterPlaceholderToolCalls } from '../tools/placeholder.js';
 import {
   createToolMaps,
   filterUnknownToolCalls,
   repairToolCallBySignature,
+  rerouteCommandMisuse,
   type ToolMaps,
 } from '../tools/names.js';
 import {
@@ -78,17 +79,16 @@ import {
   BROWSER_PROMPT_MAX_LEN,
   CONTINUE_MAX_BUDGET,
   CONTINUE_MIN_BUDGET,
-  CONTINUE_PROMPT,
-  REPARSE_MAX_BUDGET,
-  REPARSE_MIN_BUDGET,
   TOTAL_TIME_BUDGET,
   TOOL_ROUND_LIMIT,
   detectMismatchedAnswer,
   extractUserQuestion,
+  formatRecentProgress,
   getSessionDelta,
   isReadOnlyTool,
   looksUnfinishedAnswer,
   rememberSessionSend,
+  stripPlatformToolNoise,
   truncatePromptForBrowser,
 } from './helpers.js';
 import {
@@ -391,7 +391,10 @@ export async function preparePrompt(
           '不要在回答里声称『轮数已达上限』或『待下一轮』。' +
           '如果信息已经足够，请立刻调用「修改文件」类工具（见上方工具列表）落地修改；' +
           '确实还缺关键文件就继续读取（可一次并行读多个），不要停下来。' +
-          '禁止只输出计划、清单或『需先补读…』这类说明文字。';
+          '禁止只输出计划、清单或『需先补读…』这类说明文字。' +
+          // ⚠️ 2026-10-14 实测：模型会把这段指令**原文抄进回答**
+          //    （「仔细看看，系统注释说：[重要] 上述工具调用已经执行完毕…」），整轮空转。
+          '**不要引用或复述本段说明，直接动手。**';
         logger.info(`[tool_calls] 检测到 ${toolRoundCount} 轮只读不写，注入强制修改指令`);
       } else {
         roundInstruction =
@@ -401,7 +404,9 @@ export async function preparePrompt(
           '还需要看文件就直接调用读取工具（可一次并行读多个）；' +
           '需要修改就直接调用修改/写入工具；' +
           '只有在**全部工作确实完成**之后才输出总结文字；' +
-          '不要把计划清单写进项目文件、也不要把它当成最终回答。';
+          '不要把计划清单写进项目文件、也不要把它当成最终回答。' +
+          // ⚠️ 2026-10-14：模型会复述本段（连说三遍「搜索结果与本任务无关，忽略」）。
+          '**不要引用或复述本段说明，直接动手。**';
       }
       messageText += roundInstruction;
     }
@@ -471,6 +476,39 @@ export async function preparePrompt(
 /* ==================================================================== */
 /* 阶段 2：工具调用解析与降级恢复                                       */
 /* ==================================================================== */
+
+/** 重复调用抑制的阈值：历史里同一「工具名 + 参数」出现次数达到它就拦下。 */
+const REPEAT_CALL_LIMIT = 2;
+
+/** 调用指纹：`工具名|规范化后的参数 JSON`（忽略键顺序与空白）。 */
+function toolCallFingerprint(tc: {
+  function?: { name?: string; arguments?: unknown };
+}): string {
+  const name = tc?.function?.name ?? '';
+  const raw = tc?.function?.arguments;
+  let args = typeof raw === 'string' ? raw : JSON.stringify(raw ?? {});
+  try {
+    args = JSON.stringify(JSON.parse(args));
+  } catch {
+    // 参数不是合法 JSON（半截/脏数据）→ 用原文比对
+  }
+  return `${name}|${args}`;
+}
+
+/** 统计客户端历史里**已经执行过**的工具调用（指纹 → 次数）。 */
+function countHistoryToolCalls(messages: ReadonlyArray<unknown>): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const m of messages) {
+    const md = messageToDict(m as ChatMessage);
+    const tcs = md.tool_calls;
+    if (!Array.isArray(tcs)) continue;
+    for (const tc of tcs) {
+      const key = toolCallFingerprint(tc as { function?: { name?: string; arguments?: unknown } });
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+  }
+  return counts;
+}
 
 /** SSE 报文里原始 tool_call 的形状（来自 ChatGLM 的 SSE）。 */
 interface RawSseToolCall {
@@ -620,8 +658,6 @@ export interface ParseOptions {
   fixPaths: boolean;
   /** 是否丢弃 `old_str` 为空的 SearchReplace（Python 只在流式分支做了）。 */
   validateSearchReplace: boolean;
-  /** 是否允许自驱动续跑（Python 只在流式分支做了）。 */
-  selfContinue: boolean;
 }
 
 export interface ParseOutcome {
@@ -667,6 +703,14 @@ export async function parseAndRecoverToolCalls(params: {
   const { request: rawRequest, deadlineTs, workspacePath, knownFilePaths, lastMessage } = prepared;
   const tools = (rawRequest.tools ?? []) as ToolDefinition[];
   const requestId = prepared.requestId;
+
+  /* 「用户原始请求」**必须用专门的抽取函数**。
+   * ⚠️ 2026-10-14 实测：多轮工具调用时 `messages[-1]` 是 tool 结果，
+   *    于是转换轮收到的是 `# 用户原始请求\n已写入 /home/amble/object/btc/README.md（1231 字符）`
+   *    —— 转换器完全猜不到用户要什么。见 `docs/hard-constraints.md`「日志」一节。 */
+  const userRequest =
+    extractUserQuestion(rawRequest.messages as unknown as ChatMessage[]) ||
+    (lastMessage ? getTextContent(messageToDict(lastMessage as ChatMessage).content) : '');
 
   let source = parseSource;
   let sourceFromSse = fromSse;
@@ -754,6 +798,16 @@ export async function parseAndRecoverToolCalls(params: {
     }
   }
 
+  /* 「全部工具调用被过滤」时的回退正文。
+   * ⚠️ 必须在步骤 3/4 **之前**取快照：reparse / 自驱动续跑成功后会把 parsedText
+   *    改写成「正在执行 N 个操作：…」摘要，那种摘要**不能**当回退正文下发
+   *    （客户端会把它当最终回答显示后停住）。 */
+  const fallbackBodyText = parsedText.trim();
+
+  /** 去掉工具调用块后的纯文本（回退用 —— `parsed.text` 已剔除命中区间）。 */
+  const stripToolCallBlocks = (text: string): string =>
+    text ? parseToolCallsFromText(text, toolMaps).text.trim() : '';
+
   logAiResponse({
     requestId,
     platform: currentPlatform ?? rawRequest.model,
@@ -789,7 +843,6 @@ export async function parseAndRecoverToolCalls(params: {
 
   /* ===== 步骤 3：文本转换器 ===== */
   if (parsedToolCalls.length === 0 && tools.length > 0 && convertSource) {
-    const userRequest = lastMessage ? getTextContent(messageToDict(lastMessage as ChatMessage).content) : '';
     const directResult = directConvertToToolCalls(convertSource, tools, userRequest);
     const directTcs = directResult.toolCalls as unknown as ToolCallPayload[];
     if (directTcs.length > 0) {
@@ -810,155 +863,193 @@ export async function parseAndRecoverToolCalls(params: {
     }
   }
 
-  /* ===== 步骤 4：两轮策略（reparse）=====
-   * 材料 = SSE 回答 + SSE 思考 + DOM 拼接（`buildReparseInput` 合并去重）。
-   * ⚠️ 门槛**不能**写成「full_response 非空」：模型只把工具意图写在**思考**里
-   * （`type=text` 为空、DOM 又因「思考中」被拒）时，材料明明在思考文本里
-   * 却会被整段跳过 → 整轮零产出。 */
-  const reparseMaterial = buildReparseInput(source, fullResponse);
-  if (parsedToolCalls.length === 0 && tools.length > 0 && reparseMaterial) {
-    if (reparseMaterial.trim().length < 10) {
-      logger.info(`[tool_calls] 可转换材料太短(${reparseMaterial.length}字符)，跳过两轮策略`);
-    } else if (deadlineTs - Date.now() < REPARSE_MIN_BUDGET * 1000) {
-      // 剩余时间不够再走一轮完整对话 → 直接放行首轮的文本回答，
-      // 至少让客户端看到内容，而不是被中间件在 300s 处掐断。
-      logger.warn(
-        `[tool_calls] 剩余时间不足(${((deadlineTs - Date.now()) / 1000).toFixed(0)}s < ` +
-          `${REPARSE_MIN_BUDGET.toFixed(0)}s)，跳过两轮策略，直接返回文本回答`,
+  /* ==================================================================== */
+  /* 步骤 4：过滤（占位符 / 未知工具名 / 签名改派 / 命令误填）             */
+  /*                                                                      */
+  /* ⚠️ 必须在「动作恢复轮」**之前**跑：只有过滤完才知道本轮到底有没有可    */
+  /*    下发的调用，也才能把「模型调了客户端没有的工具」当成触发信号。      */
+  /* ==================================================================== */
+  const beforeFilter = parsedToolCalls.length;
+
+  /** 被「客户端没有这个工具」丢掉的调用名 / 原文（恢复轮要用）。 */
+  let droppedUnknownNames: string[] = [];
+  let droppedUnknownCalls: string[] = [];
+  /** 被「重复调用抑制」丢掉的调用原文（回退正文要用）。 */
+  let suppressedRepeats: string[] = [];
+
+  /** 客户端历史里已执行过的调用指纹 → 次数（重复调用抑制用）。 */
+  const historyCallCounts = countHistoryToolCalls(prepared.request.messages);
+
+  /** 统一的过滤链：占位符 → 未知工具名 → 签名改派 → 命令误填 → 重复调用抑制。 */
+  const filterToolCalls = (
+    calls: ToolCallPayload[],
+  ): { calls: ToolCallPayload[]; droppedNames: string[] } => {
+    let current = calls;
+    const droppedNames: string[] = [];
+
+    if (current.length > 0) {
+      // 占位符过滤：丢弃参数为示例文本（如 "真实文件路径"/"文件内容"）的调用
+      current = filterPlaceholderToolCalls(current).valid;
+    }
+    if (current.length > 0) {
+      // 未知工具名过滤：AI 编造的工具名（如 "工具名称"）客户端无法执行
+      const unknown = filterUnknownToolCalls(current, tools);
+      current = unknown.valid;
+      droppedNames.push(...unknown.dropped.map((tc) => tc.function?.name ?? ''));
+      droppedUnknownCalls.push(
+        ...unknown.dropped.map((tc) => `${tc.function?.name ?? '?'}(${tc.function?.arguments ?? ''})`),
       );
-    } else {
-      logger.info(
-        `[tool_calls] 启动两轮对话策略（fallback），材料 ${reparseMaterial.length} 字符` +
-          `（SSE回答=${source.length}, 拼接=${fullResponse.length}，差额来自 SSE 思考）`,
-      );
-      try {
-        const userRequest = lastMessage
-          ? getTextContent(messageToDict(lastMessage as ChatMessage).content)
-          : '';
-        const conversationHistory =
-          prepared.request.messages.length > 0
-            ? formatMessagesAsText(prepared.request.messages as unknown as ChatMessage[])
-            : '';
-
-        const reparseMsg = buildReparsePrompt(reparseMaterial, tools, {
-          userRequest,
-          conversationHistory,
-        });
-
-        const reparseRequest: ChatRequest = {
-          message: reparseMsg,
-          model: rawRequest.model,
-          stream: false,
-          // 与首轮共享同一个截止时间，同时给 reparse 自身一个上限：
-          // 实测它会一直「思考」到被总预算掐断却什么都没产出。
-          deadlineTs: Math.min(deadlineTs, Date.now() + REPARSE_MAX_BUDGET * 1000),
-          // 用**独立页面**跑转换请求：否则它会把主页面上的会话切走，
-          // 主会话上下文丢失、会话复用失效。
-          context: { use_aux_page: true },
-        };
-
-        let reparseResponse = '';
-        for await (const [chunk] of streamWithFailover(
-          modelRouter,
-          rawRequest.model,
-          reparseRequest,
-          historyDb,
-          `${requestId}#reparse`,
-        )) {
-          reparseResponse += chunk.content ?? '';
-        }
-
-        const reparseParsed = parseToolCallsFromText(reparseResponse, toolMaps);
-        const reparseTcs = reparseParsed.toolCalls as unknown as ToolCallPayload[];
-        if (reparseTcs.length > 0) {
-          parsedToolCalls = reparseTcs;
-          parsedText = `正在执行 ${reparseTcs.length} 个操作：${reparseTcs
-            .map((tc) => tc.function.name)
-            .join(', ')}`;
-          logger.info(`[tool_calls] 两轮策略成功：${reparseTcs.length} 个工具调用`);
-        } else {
-          logger.info('[tool_calls] 两轮策略未提取到工具调用');
-        }
-      } catch (error) {
-        logger.warn(`[tool_calls] 两轮策略失败: ${errorMessage(error)}`);
+    }
+    if (current.length > 0) {
+      /* 按参数签名纠正选错的工具：模型想创建文件却调 edit_file 并套用
+       * write_file 的签名（实测：edit_file(path, content)）—— 客户端会拒收
+       * 「未知参数 content」。若恰好只有一个已声明工具的签名装得下这些参数
+       * （write_file），就改派过去，省掉一轮注定失败的往返。 */
+      const { repaired, reroutes } = repairToolCallBySignature(current, tools);
+      current = repaired;
+      for (const r of reroutes) {
+        logger.warn(
+          `[tool_calls] 按参数签名改派工具: ${r.from} → ${r.to}` +
+            `（未知参数 ${r.unknownKeys.join(', ')}）`,
+        );
       }
     }
+    if (current.length > 0) {
+      /* 「拿文件路径参数当命令用」→ 改派给命令执行工具。
+       * 实测（2026-10-14）：模型把 `cd /x && ./start.sh` 塞进 `write_file` 的 path，
+       * 客户端真的在工作目录里创建了一个同名文件，之后又 rm/rmdir 收拾垃圾。 */
+      const { repaired, reroutes } = rerouteCommandMisuse(current, tools);
+      current = repaired;
+      for (const r of reroutes) {
+        logger.warn(
+          `[tool_calls] 路径参数里装的是 shell 命令，改派工具: ${r.from} → ${r.to}` +
+            `（命令=${JSON.stringify(r.commandPreview)}）`,
+        );
+      }
+    }
+
+    /* 重复调用抑制（2026-10-14，止住真实死循环）：
+     * 客户端历史里「同一工具 + 同一参数」已经执行过 ≥2 次，说明模型在原地打转
+     * （实测：`bash ./start.sh status` 被反复重发，每次还配同一段收尾结论）。
+     * 再下发只会让客户端的 agent 循环继续转 → 抑制它，让本轮以文本结束。
+     * 阈值取 2：允许模型复核一次，第三次起才拦。 */
+    if (current.length > 0) {
+      const kept: ToolCallPayload[] = [];
+      for (const tc of current) {
+        const seen = historyCallCounts.get(toolCallFingerprint(tc)) ?? 0;
+        if (seen >= REPEAT_CALL_LIMIT) {
+          suppressedRepeats.push(`${tc.function?.name ?? '?'}(${tc.function?.arguments ?? ''})`);
+          continue;
+        }
+        kept.push(tc);
+      }
+      if (kept.length !== current.length) {
+        logger.warn(
+          `[tool_calls] 抑制 ${current.length - kept.length} 个重复调用` +
+            `（同一工具+参数在客户端历史里已执行 ≥${REPEAT_CALL_LIMIT} 次）`,
+        );
+      }
+      current = kept;
+    }
+
+    return { calls: current, droppedNames };
+  };
+
+  {
+    const filtered = filterToolCalls(parsedToolCalls);
+    parsedToolCalls = filtered.calls;
+    droppedUnknownNames = filtered.droppedNames;
   }
 
-  /* ===== 步骤 5：自驱动续跑（仅流式分支）=====
-   * 模型「只给计划、不调工具」时客户端会直接结束回合，
-   * 用户看到「读了半天却没改文件、任务终止」。这里识别这类回答，
-   * 自己再驱动一轮，让它把刚说的下一步变成工具调用。 */
-  if (options.selfContinue) {
+  /* ==================================================================== */
+  /* 步骤 5：动作恢复轮（**唯一一层兜底**）                               */
+  /*                                                                      */
+  /* ⚠️ 触发条件**只剩两个**（2026-10-14 实测踩坑后收紧）：                */
+  /*   ① 调了客户端没有的工具（明确无效，必须救）；                        */
+  /*   ② 回答像计划书 / 只说不做（`looksUnfinishedAnswer`）。              */
+  /*                                                                      */
+  /* 原来还有一条「本轮一个工具调用都没有 → 强制再驱动一轮」，它会把**正常   */
+  /* 收尾**的回答（「无需进一步操作」「已确认无变化」）也判成「没推进任务」   */
+  /* 并逼模型再动手 —— 实测直接造成死循环：每轮都重发同一句收尾 + 再跑一次    */
+  /* `status`。原生模型的做法是：没有工具调用 = 本轮结束（stop）。          */
+  /* 详见 docs/native-parity.md「取舍与代价」。                            */
+  /* ==================================================================== */
+  const recoveryMaterial = stripPlatformToolNoise(buildReparseInput(source, fullResponse));
+  const isUnfinished = looksUnfinishedAnswer(parsedText);
+  const needsRecovery =
+    parsedToolCalls.length === 0 &&
+    tools.length > 0 &&
+    (droppedUnknownNames.length > 0 || isUnfinished);
+
+  if (needsRecovery) {
     const remaining = deadlineTs - Date.now();
-    if (parsedToolCalls.length === 0 && tools.length > 0 && looksUnfinishedAnswer(parsedText) && remaining >= CONTINUE_MIN_BUDGET * 1000) {
+    const uniqueNames = [...new Set(droppedUnknownNames)];
+
+    if (remaining < CONTINUE_MIN_BUDGET * 1000) {
       logger.warn(
-        `[tool_calls] 回答疑似「只说计划没动手」，启动自驱动续跑` +
-          `（剩余 ${(remaining / 1000).toFixed(0)}s）`,
+        `[tool_calls] 需要动作恢复轮，但剩余时间(${(remaining / 1000).toFixed(0)}s) 不足 ` +
+          `${CONTINUE_MIN_BUDGET.toFixed(0)}s，跳过（直接回文本回答）`,
+      );
+    } else {
+      logger.warn(
+        '[tool_calls] 触发动作恢复轮（唯一一层兜底）：' +
+          (uniqueNames.length ? `模型调了客户端没有的工具 ${uniqueNames.join(', ')}；` : '') +
+          `材料 ${recoveryMaterial.length} 字符；` +
+          (isUnfinished ? '回答疑似「只说不做」' : '本轮无工具调用'),
       );
       try {
-        const contPrompt = CONTINUE_PROMPT.replace('{answer}', parsedText.slice(0, 4000)).replace(
-          '{tools}',
-          // ⚠️ 必须带 workspace_path / known_file_paths：不带时模型会编造出
-          //    `/workspace/core/xxx.py` 这种路径，客户端读不到文件，续跑等于白跑。
-          formatToolsAsText(tools, {
-            workspacePath,
-            knownFilePaths: knownFilePaths.length > 0 ? knownFilePaths : undefined,
-          }),
-        );
+        const recoveryPrompt = buildActionRecoveryPrompt(tools, {
+          // 优先给「材料」（SSE 回答 + 思考 + DOM 拼接，已去噪）：模型可能已经把
+          // 完整内容写在文字里，恢复轮要能原样搬进工具参数。
+          answer: recoveryMaterial || parsedText,
+          invalidNames: droppedUnknownNames,
+          invalidCalls: droppedUnknownCalls,
+          recentProgress: formatRecentProgress(prepared.request.messages as unknown as ChatMessage[]),
+          // ⚠️ 必须带工作目录：不带时模型会编造 `/workspace/xxx.py` 这种路径。
+          currentWorkingDir: workspacePath || process.cwd(),
+        });
 
-        const contRequest: ChatRequest = {
-          message: contPrompt,
+        const recoveryRequest: ChatRequest = {
+          message: recoveryPrompt,
           model: rawRequest.model,
           stream: false,
           deadlineTs: Math.min(deadlineTs, Date.now() + CONTINUE_MAX_BUDGET * 1000),
+          // 用**独立页面**跑：否则会把主页面上的会话切走，主会话上下文丢失。
           context: { use_aux_page: true },
         };
 
-        let contResponse = '';
+        let recoveryResponse = '';
         for await (const [chunk] of streamWithFailover(
           modelRouter,
           rawRequest.model,
-          contRequest,
+          recoveryRequest,
           historyDb,
-          `${requestId}#continue`,
+          `${requestId}#recover`,
         )) {
-          contResponse += chunk.content ?? '';
+          recoveryResponse += chunk.content ?? '';
         }
 
-        let contTcs = parseToolCallsFromText(contResponse, toolMaps).toolCalls as unknown as ToolCallPayload[];
-        // 过滤器同样要走一遍：编造的工具名/占位符不能下发
-        if (contTcs.length > 0) contTcs = filterPlaceholderToolCalls(contTcs).valid;
-        if (contTcs.length > 0) contTcs = filterUnknownToolCalls(contTcs, tools).valid;
-        if (contTcs.length > 0) {
-          const { repaired, reroutes } = repairToolCallBySignature(contTcs, tools);
-          contTcs = repaired;
-          for (const r of reroutes) {
-            logger.warn(
-              `[tool_calls] 按参数签名改派工具: ${r.from} → ${r.to}` +
-                `（未知参数 ${r.unknownKeys.join(', ')}）`,
-            );
-          }
-        }
+        // 这一轮的产出同样要过全部过滤器（编造的名字 / 占位符不能下发）
+        const recovered = filterToolCalls(
+          parseToolCallsFromText(recoveryResponse, toolMaps).toolCalls as unknown as ToolCallPayload[],
+        );
 
-        if (contTcs.length > 0) {
-          parsedToolCalls = contTcs;
-          const cnames = contTcs.map((tc) => tc.function.name);
-          parsedText = `正在执行 ${contTcs.length} 个操作：${cnames.join(', ')}`;
-          logger.info(`[tool_calls] 自驱动续跑成功：${contTcs.length} 个工具调用 ${cnames.join(', ')}`);
+        if (recovered.calls.length > 0) {
+          parsedToolCalls = recovered.calls;
+          // ⚠️ **不合成正文**：正文只放模型自己的话（原生模型的行为），
+          //    这里原来会写「正在执行 N 个操作：…」——那是我们自己造的假回复。
+          logger.info(
+            `[tool_calls] 动作恢复轮成功：${recovered.calls.length} 个工具调用 ` +
+              `${recovered.calls.map((tc) => tc.function.name).join(', ')}`,
+          );
         } else {
           logger.warn(
-            `[tool_calls] 自驱动续跑仍未产出工具调用（回答长度=${contResponse.length}），保持原文本回答`,
+            `[tool_calls] 动作恢复轮仍未产出可执行的工具调用（回答长度=${recoveryResponse.length}）`,
           );
         }
       } catch (error) {
-        logger.warn(`[tool_calls] 自驱动续跑失败: ${errorMessage(error)}`);
+        logger.warn(`[tool_calls] 动作恢复轮失败: ${errorMessage(error)}`);
       }
-    } else if (parsedToolCalls.length === 0 && tools.length > 0 && looksUnfinishedAnswer(parsedText)) {
-      logger.warn(
-        `[tool_calls] 回答疑似「只说计划没动手」，但剩余时间` +
-          `(${(remaining / 1000).toFixed(0)}s) 不足 ${CONTINUE_MIN_BUDGET.toFixed(0)}s，跳过自驱动续跑`,
-      );
     }
   }
 
@@ -1030,38 +1121,37 @@ export async function parseAndRecoverToolCalls(params: {
     if (valid.length < parsedToolCalls.length) parsedToolCalls = valid;
   }
 
-  /* ===== 步骤 8：过滤（占位符 / 未知工具名）+ 回退 ===== */
-  const beforeFilter = parsedToolCalls.length;
-
-  if (parsedToolCalls.length > 0) {
-    // 占位符过滤：丢弃参数为示例文本（如 "真实文件路径"/"文件内容"）的调用
-    parsedToolCalls = filterPlaceholderToolCalls(parsedToolCalls).valid;
-  }
-  if (parsedToolCalls.length > 0) {
-    // 未知工具名过滤：AI 编造的工具名（如 "工具名称"）客户端无法执行
-    parsedToolCalls = filterUnknownToolCalls(parsedToolCalls, tools).valid;
-  }
-  if (parsedToolCalls.length > 0) {
-    /* 按参数签名纠正选错的工具：模型想创建文件却调 edit_file 并套用
-     * write_file 的签名（实测：edit_file(path, content)）—— 客户端会拒收
-     * 「未知参数 content」。若恰好只有一个已声明工具的签名装得下这些参数
-     * （write_file），就改派过去，省掉一轮注定失败的往返。 */
-    const { repaired, reroutes } = repairToolCallBySignature(parsedToolCalls, tools);
-    parsedToolCalls = repaired;
-    for (const r of reroutes) {
-      logger.warn(
-        `[tool_calls] 按参数签名改派工具: ${r.from} → ${r.to}` +
-          `（未知参数 ${r.unknownKeys.join(', ')}）`,
-      );
-    }
-  }
-
-  if (beforeFilter > 0 && parsedToolCalls.length === 0 && fullResponse) {
+  /* ===== 回退正文（全部被过滤时）===== */
+  if (beforeFilter > 0 && parsedToolCalls.length === 0) {
     /* 全部被过滤 → 必须回退为**真实文本**。
      * 绝不能保留「正在执行 N 个操作：X」这类摘要：客户端会把它当作最终回答显示
-     * 然后停止，不再继续执行任何工具（表现为「返回工具调用后客户端没反应」）。 */
+     * 然后停止，不再继续执行任何工具（表现为「返回工具调用后客户端没反应」）。
+     * ⚠️ 与原设计不同处（2026-10-14）：原实现把 `source`（SSE 原文）整段下发，
+     *    而整段可能**就是** `<tool_call>{…}</tool_call>` —— 客户端会把这段 XML
+     *    当正文显示、然后结束回合，用户看到的是「对话无故停止」。
+     *    现在改为：① 用已剔除工具块的正文；② 工具名不存在时补一句可操作的说明。 */
     logger.warn('[tool_calls] 全部工具调用均被过滤，回退为完整文本响应');
-    parsedText = sourceFromSse && source ? source : fullResponse;
+
+    const body =
+      fallbackBodyText ||
+      stripToolCallBlocks(source) ||
+      stripToolCallBlocks(fullResponse);
+
+    if (droppedUnknownNames.length > 0) {
+      const uniqueNames = [...new Set(droppedUnknownNames)];
+      parsedText =
+        `⚠️ 模型调用了本环境不存在的工具「${uniqueNames.join(', ')}」` +
+        '（它不是客户端提供的工具），本轮未执行任何操作。请回复「继续」让我用可用工具重做。' +
+        (body ? `\n\n${body}` : '');
+    } else if (suppressedRepeats.length > 0 && body) {
+      /* 重复调用被抑制：模型自己的收尾/结论就是答案，**不加任何前缀**。 */
+      parsedText = body;
+    } else {
+      parsedText =
+        body ||
+        '⚠️ 本轮模型只输出了工具调用的**格式示例/占位符文本**，未执行任何操作。' +
+          '请回复「继续」让我重做。';
+    }
   }
 
   /* ===== 步骤 9：批量下发策略 =====
@@ -1087,23 +1177,22 @@ export async function parseAndRecoverToolCalls(params: {
     }
   }
 
-  // 有工具调用时，文本过长只发简短摘要（避免代码/文件内容溢出到聊天里）
-  if (parsedToolCalls.length > 0 && parsedText.length > 200) {
-    parsedText = `正在执行 ${parsedToolCalls.length} 个操作：${parsedToolCalls
-      .map((tc) => tc.function.name)
-      .join(', ')}`;
-  }
+  /* ⚠️ 与原设计不同处（2026-10-14，见 docs/native-parity.md）：
+   * 这里原来会在「有工具调用且正文 > 200 字符」时把正文改写成
+   * 「正在执行 N 个操作：a, b」——那是我们自己造的假回复（原生模型只回自己的话）。
+   * 现在**不做任何改写**：正文就是模型写的文字（可能是空的）。 */
 
   /* ===== 步骤 10：保险 —— 检测「回答与本项目无关」=====
-   * 只对「无工具调用的纯文本回答」做检查（有工具调用时会话在正常推进）。 */
+   * 只对「无工具调用的纯文本回答」做检查（有工具调用时会话在正常推进）。
+   * ⚠️ 与原设计不同处：**只打日志，不再往正文里塞 `[提示] …` 前缀** ——
+   *    原生模型的 content 里不会出现我们造的文案。 */
   if (parsedText && parsedToolCalls.length === 0) {
     const mismatchHint = detectMismatchedAnswer(parsedText, workspacePath);
     if (mismatchHint) {
       logger.warn(
-        `[guard] 回答与本项目不匹配（工作目录=${workspacePath}），已在正文前附加提示。` +
+        `[guard] 回答与本项目不匹配（工作目录=${workspacePath}），仅记录日志（不改写正文）。` +
           `回答开头: ${JSON.stringify(parsedText.slice(0, 120))}`,
       );
-      parsedText = mismatchHint + parsedText;
     }
   }
 
@@ -1221,7 +1310,7 @@ export async function* streamChatCompletion(
         modelRouter,
         historyDb,
         toolMaps,
-        options: { fixPaths: true, validateSearchReplace: true, selfContinue: true },
+        options: { fixPaths: true, validateSearchReplace: true },
       });
       parsedText = outcome.parsedText;
       parsedToolCalls = outcome.parsedToolCalls;
@@ -1231,17 +1320,16 @@ export async function* streamChatCompletion(
        * 客户端收到空回复会表现为「AI 没反应」，用户无法区分「卡住」与「失败」。 */
       if (!parsedText && parsedToolCalls.length === 0 && !fullResponse) {
         logger.warn(
-          '[tool_calls] 检测到空响应（首轮无正文、各策略均未恢复出内容），向客户端说明原因后结束',
+          '[tool_calls] 检测到空响应（首轮无正文、兜底轮也没恢复出内容），向客户端说明原因后结束',
         );
-        const platform = currentPlatform ?? model;
         yield contentChunk({
           id: requestId,
           model,
           role: 'assistant',
+          // ⚠️ 与原生对齐：不写「[平台] …」这类内部前缀（平台名在日志里）。
           content:
-            `[${platform}] 本轮未产出任何可用内容` +
-            '（模型没有生成正文，从思考/转换中也未恢复出工具调用）。' +
-            '请重试；若反复出现，建议换平台或把提问拆小。',
+            '本轮未产出任何可用内容（模型没有生成正文，也没有给出工具调用）。' +
+            '请重试；若反复出现，把请求拆小一点。',
         });
         yield contentChunk({ id: requestId, model, content: '', finishReason: 'stop' });
         yield DONE;
@@ -1256,7 +1344,7 @@ export async function* streamChatCompletion(
         yield contentChunk({ id: requestId, model, content: parsedText });
       }
       if (parsedToolCalls.length > 0) {
-        // 所有 tool_calls 合成**一个** chunk，避免客户端重复显示「正在执行」
+        // 所有 tool_calls 合成**一个** chunk（客户端只显示一次工具调用）
         yield toolCallsChunk({ id: requestId, model, toolCalls: parsedToolCalls });
         logger.info(`解析到 ${parsedToolCalls.length} 个工具调用`);
       } else if (!parsedText) {
@@ -1462,7 +1550,7 @@ export async function nonStreamChatCompletion(
       modelRouter,
       historyDb,
       toolMaps,
-      options: { fixPaths: false, validateSearchReplace: false, selfContinue: false },
+      options: { fixPaths: false, validateSearchReplace: false },
     });
 
     const responseMessage: Record<string, unknown> = { role: 'assistant' };

@@ -1,4 +1,4 @@
-# webaiapi（命令名：`wbai`）
+# webaiapi（命令名：`webapi`）
 
 把国产 AI 聊天网页（目前支持 **ChatGLM / 智谱清言**）包装成 **OpenAI 兼容 API**。
 纯浏览器自动化（Playwright Firefox），**不需要 API Key、不需要逆向签名**——你只要在浏览器里登录一次。
@@ -25,16 +25,16 @@ npx playwright install firefox
 然后登录并捕获凭证（会打开可见的浏览器，你手动登录）：
 
 ```bash
-wbai login
+webapi login
 ```
 
 不加参数会**交互式**让你选平台（`↑/↓` + 回车，或直接敲编号），随后选「添加账号 / 重新登录」。
-想跳过菜单就直接给平台名：`wbai login chatglm`。
+想跳过菜单就直接给平台名：`webapi login chatglm`。
 
 > 不确定环境有没有问题？先跑一次自检：
 
 ```bash
-wbai doctor
+webapi doctor
 ```
 
 它会检查 Node 版本、Firefox 二进制、凭证、端口，并给出可复制的修复命令。
@@ -45,7 +45,7 @@ wbai doctor
 ## 启动
 
 ```bash
-wbai start
+webapi start
 ```
 
 服务默认监听 `http://0.0.0.0:8631`，OpenAI 兼容端点在 `/v1`：
@@ -72,19 +72,19 @@ curl -N -X POST http://localhost:8631/v1/chat/completions \
 
 | 命令 | 说明 |
 |---|---|
-| `wbai start` | 启动服务（前台运行，Ctrl-C 退出） |
-| `wbai doctor` | 自检：Node / Firefox / 凭证 / 端口 |
-| `wbai status` | 运行状态：账号、角色、辅助通道、请求池 |
-| `wbai accounts` | 只看账号与角色（判断「多账号有没有生效」的权威视图） |
-| `wbai health` | 各平台登录状态 |
-| `wbai login [<platform>] [--account <id>]` | 登录并捕获凭证（不给参数则交互式选择平台/账号） |
-| `wbai logout [<platform>] [--account <id>]` | 删除某账号的凭证（不给参数则交互式选择） |
+| `webapi start` | 启动服务（前台运行，Ctrl-C 退出） |
+| `webapi doctor` | 自检：Node / Firefox / 凭证 / 端口 |
+| `webapi status` | 运行状态：账号、角色、辅助通道、请求池 |
+| `webapi accounts` | 只看账号与角色（判断「多账号有没有生效」的权威视图） |
+| `webapi health` | 各平台登录状态 |
+| `webapi login [<platform>] [--account <id>]` | 登录并捕获凭证（不给参数则交互式选择平台/账号） |
+| `webapi logout [<platform>] [--account <id>]` | 删除某账号的凭证（不给参数则交互式选择） |
 
 脚本 / CI 里用非交互写法（`--yes` 跳过确认）：
 
 ```bash
-wbai login chatglm --account acc2 --yes
-wbai logout chatglm --account acc2 --yes
+webapi login chatglm --account acc2 --yes
+webapi logout chatglm --account acc2 --yes
 ```
 
 ## 模型
@@ -100,11 +100,11 @@ wbai logout chatglm --account acc2 --yes
 加第二个账号后，服务会启用**辅助通道**：压缩历史/工具调用转换等辅助任务
 会在另一个账号的独立页面上跑，与你的主对话**真正并行**，不再排队。
 
-再跑一次 `wbai login` 选「添加新账号」即可，**账号名会自动从登录身份派生**
+再跑一次 `webapi login` 选「添加新账号」即可，**账号名会自动从登录身份派生**
 （用户名 → uid），不用自己想名字：
 
 ```bash
-wbai login
+webapi login
 #   要登录哪个平台？        → ChatGLM (智谱)
 #   这次要做什么？          → ➕ 添加新账号
 #   ...手动登录另一个账号...
@@ -113,7 +113,7 @@ wbai login
 
 选错了随时可以退：二级菜单里有 `← 返回上一步（重新选平台）`，
 平台菜单里有 `✗ 退出`；任何时候按 `Esc` / `Ctrl+C` 也会取消。
-（用 `wbai login <platform>` 明确指定平台时，菜单里给的是 `✗ 取消` —— 没有上一步可回。）
+（用 `webapi login <platform>` 明确指定平台时，菜单里给的是 `✗ 取消` —— 没有上一步可回。）
 
 > ⚠️ **两个账号必须是不同的人。** 系统浏览器很可能还留着上一个账号的登录态，
 > 抓到同一个人时服务会以为「有两个账号」并启用并行，结果两边打同一个账号，
@@ -121,11 +121,11 @@ wbai login
 > - 抓到的和已有账号是同一个登录态 → 提示你选择「更新该账号 / 另存为新账号 / 取消」
 > - 非交互时（脚本）默认**更新原账号**，绝不悄悄多出一个重名账号
 
-用 `wbai accounts` 核对身份与角色分配。主/辅角色**启动时随机分配**以摊平额度消耗；
+用 `webapi accounts` 核对身份与角色分配。主/辅角色**启动时随机分配**以摊平额度消耗；
 需要钉死时用环境变量：
 
 ```bash
-CHATGLM_MAIN_ACCOUNT=acc2 wbai start
+CHATGLM_MAIN_ACCOUNT=acc2 webapi start
 ```
 
 ## 配置
@@ -153,7 +153,7 @@ CHATGLM_MAIN_ACCOUNT=acc2 wbai start
 ## 常见问题
 
 **「请求过于频繁，请稍后再试」**
-多半是**未登录**（访客额度用完了）。重新登录：`wbai login chatglm`。
+多半是**未登录**（访客额度用完了）。重新登录：`webapi login chatglm`。
 
 **抓到的账号不是我想登的那个**
 系统浏览器里往往还留着上一个账号的登录态。先在该页面**退出登录**，再登目标账号。

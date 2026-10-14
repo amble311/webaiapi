@@ -218,6 +218,147 @@ export const RESET_SSE_JS = `() => { if (window.__glmSSEReset) window.__glmSSERe
 /** 读取页面捕获到的 SSE 原始文本。 */
 export const SSE_GET_JS = `() => (window.__glmSSEGet ? window.__glmSSEGet() : null)`;
 
+/**
+ * 侦察：读取页面捕获到的**平台请求体**。
+ *
+ * 目的：判断「能否把客户端工具定义交给平台、用它的原生函数调用通道承载客户端工具」。
+ * 见 `SSE_CAPTURE_JS` 的说明与 `docs/migration-status.md`。
+ */
+export const REQUEST_BODIES_GET_JS = `() => (window.__glmSSEBodiesGet ? window.__glmSSEBodiesGet() : null)`;
+
+/**
+ * 侦察：找出页面上与「联网搜索 / 深度思考 / 工具」有关的开关控件。
+ *
+ * ## 为什么要找它们（2026-10-14 实测）
+ * 平台自己发出去的 ask 请求体里有 `meta_data.is_networking`（默认 **true**）、
+ * `chat_mode: "deep_thinking"`、`reasoning_effort: "max"`：
+ * 前者让模型不停去调平台自带的联网搜索（`search` 单轮刷 57 次），
+ * 后者让每回合要「想」90~200s。这两个都是**页面 UI 状态**，
+ * 只有点到对应开关才能在发请求前改掉它们。
+ *
+ * 因此先把候选控件与本地存储键 dump 出来（`logs/chatglm_page_toggles.txt`），
+ * 拿到稳定选择器后再实现「发送前关掉它们」。
+ */
+/**
+ * 发送前设置页面开关：**关掉「联网搜索」**、**把「思考强度」降到「快速」**。
+ *
+ * ## 为什么（2026-10-14 实测）
+ * 平台 ask 请求体里默认是 `is_networking: true` + `chat_mode: deep_thinking` +
+ * `reasoning_effort: max`：
+ * - 联网开着 → 模型把「bash 怎么删带空格的目录」当检索问题，单轮刷 57 次 `search`，耗 210s；
+ * - 极致思考 → 每回合「想」90~200s。
+ * 两个都是**页面 UI 状态**，所以在发送前点掉它们（探针给出选择器：
+ * `.search-btn`、`.item-think` → `.think-mode-item`）。
+ *
+ * 幂等：已经是目标状态就不点（返回 `changed:false`）。
+ * 注意：这里用页面内 `el.click()`（不受 Playwright 可见性检查影响），
+ * 因为「思考强度」子菜单是 popper —— 渲染在 DOM 里但默认隐藏。
+ */
+export const APPLY_CHAT_PREFS_JS = `() => {
+    const clip = (s, n) => String(s == null ? '' : s).replace(/\\s+/g, ' ').trim().slice(0, n || 80);
+    const popper = (el) => {
+        try {
+            const p = el.closest('[class*="popper"], [class*="dropdown"], [class*="submenu"], [class*="menu"]');
+            return p ? clip(p.className, 60) : '';
+        } catch (e) { return ''; }
+    };
+    const snapItem = (el, i) => ({
+        i: i,
+        text: clip(el.innerText, 30),
+        cls: clip(el.className, 60),
+        visible: !!(el.offsetWidth || el.offsetHeight),
+        popper: popper(el),
+    });
+    const snap = () => ({
+        searchBtn: (() => {
+            const b = document.querySelector('.search-btn') ||
+                document.querySelector('.operation-btn[class*="search"]');
+            return b ? { cls: clip(b.className, 120), html: clip(b.innerHTML, 80),
+                         parentCls: clip((b.parentElement || {}).className, 80) } : null;
+        })(),
+        thinkEntry: (() => {
+            const e = document.querySelector('.item-think');
+            return e ? { cls: clip(e.className, 60), text: clip(e.innerText, 30),
+                         visible: !!(e.offsetWidth || e.offsetHeight) } : null;
+        })(),
+        items: Array.prototype.slice.call(document.querySelectorAll('.think-mode-item')).map(snapItem),
+    });
+
+    const out = { notes: [], before: snap(), clicked: [], after: null };
+    const click = (el) => { try { el.click(); return true; } catch (e) { return false; } };
+    const on = (el) => /active|selected|is-checked|checked|open/i.test(String(el.className || ''));
+
+    // ---- 1) 联网搜索：⚠️ 2026-10-14 实测**不改** ----
+    // .search-btn 点击只会弹出模型下拉（el-dropdown/model-select-item），
+    // 而平台请求体里的 is_networking 始终为 true —— 它不是页面上可切的开关
+    // （更像「允许联网」的能力位）。文档见 docs/native-parity.md 阶段 3。
+
+    // ---- 2) 思考强度：逐个「快速」项都点一次（可能有多个 popper，其中一个是真菜单）----
+    try {
+        const items = Array.prototype.slice.call(document.querySelectorAll('.think-mode-item'));
+        items.forEach((el, i) => {
+            if (!/快速/.test(el.innerText || '')) return;
+            const entry = document.querySelector('.item-think');
+            if (entry) {
+                try {
+                    entry.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+                    entry.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                } catch (e) {}
+            }
+            out.clicked.push('fast#' + i + ':onBefore=' + on(el) + ':clicked=' + click(el));
+        });
+    } catch (e) { out.notes.push('think:' + e); }
+
+    out.after = snap();
+    return out;
+}`;
+
+export const PROBE_CHAT_TOGGLES_JS = `() => {
+    const clip = (s, n) => String(s == null ? '' : s).slice(0, n || 60);
+    const attr = (el, name) => { try { return String(el.getAttribute(name) || ''); } catch (e) { return ''; } };
+    const rec = (el) => ({
+        tag: (el.tagName || '').toLowerCase(),
+        cls: clip(el.className, 80),
+        text: clip((el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim(), 60),
+        aria: clip(attr(el, 'aria-label'), 40),
+        role: clip(attr(el, 'role'), 20),
+        checked: clip(attr(el, 'aria-checked') || attr(el, 'data-checked'), 10),
+        title: clip(attr(el, 'title'), 40),
+        visible: !!(el.offsetWidth || el.offsetHeight),
+    });
+
+    const out = { url: location.href, controls: [], storage: {}, matched: [] };
+    const sel = [
+        '.el-switch', '[role="switch"]', '[aria-checked]',
+        'button', '[role="button"]',
+        '[class*="switch"]', '[class*="net"]', '[class*="search"]',
+        '[class*="tool"]', '[class*="mode"]', '[class*="deep"]', '[class*="think"]'
+    ].join(',');
+
+    document.querySelectorAll(sel).forEach((el) => {
+        if (out.controls.length >= 120) return;
+        const r = rec(el);
+        if (!r.visible && !r.text) return;
+        out.controls.push(r);
+        if (/联网|搜索|工具|深度|思考|模式|模型|net|search|tool|deep|think|mode/i.test(r.text + ' ' + r.aria + ' ' + r.cls)) {
+            out.matched.push(r);
+        }
+    });
+
+    const dump = (store, prefix) => {
+        try {
+            for (const k of Object.keys(store)) {
+                if (Object.keys(out.storage).length >= 60) return;
+                out.storage[prefix + k] = clip(store.getItem(k), 120);
+            }
+        } catch (e) {}
+    };
+    dump(window.localStorage, 'local:');
+    dump(window.sessionStorage, 'sess:');
+
+    return out;
+}`;
+
 /** 诊断：判定平台限制时的依据（`.answer` 条数 + 最后一条内容 + URL）。 */
 export const BUSY_NOTICE_DIAG_JS = `() => {
     const els = document.querySelectorAll('.answer');

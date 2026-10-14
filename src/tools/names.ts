@@ -69,7 +69,13 @@ export const FILE_SYSTEM_TOOLS = new Set([
 /** 用户交互类工具：同样回传客户端执行。 */
 export const USER_INTERACTION_TOOLS = new Set(['AskUserQuestion', 'TodoWrite', 'NotifyUser']);
 
-/** 平台自带工具名 —— 出现即说明模型在「对着网页搜索」干活，必须专项告警。 */
+/**
+ * 平台自带工具名 —— 出现即说明模型在「对着网页自己的工具」干活，必须专项告警。
+ *
+ * ⚠️ 2026-10-14 实测：`execute_sandbox_code` 是 ChatGLM 自己的代码沙箱工具。
+ * 模型在 `answer_type=python` 的回合里会去调它，而客户端并没有这个工具 →
+ * 被丢弃后整轮降级成纯文本、客户端直接结束回合（「对话无故停止」）。
+ */
 export const PLATFORM_BUILTIN_TOOL_NAMES = new Set([
   'search',
   'open',
@@ -78,6 +84,9 @@ export const PLATFORM_BUILTIN_TOOL_NAMES = new Set([
   'browse',
   'browser',
   'finish',
+  'execute_sandbox_code',
+  'execute_code',
+  'python_interpreter',
 ]);
 
 /** 一次请求内有效的工具名/参数名映射。 */
@@ -523,6 +532,165 @@ export function repairToolCallBySignature(
 
     // 0 个（没有更好的去处）或 ≥2 个（有歧义）→ 原样交给客户端裁决
     repaired.push(tc);
+  }
+
+  return { repaired, reroutes };
+}
+
+/* ==================================================================== */
+/* 「拿文件路径参数当命令用」→ 改派给命令执行工具                       */
+/* ==================================================================== */
+
+/**
+ * 命令动词前缀 —— **必须带尾随空格**。
+ *
+ * ⚠️ 不带空格会把相对路径误伤（`python_utils/app.py` 以 `python` 开头）。
+ */
+const SHELL_COMMAND_PREFIXES: ReadonlyArray<string> = [
+  'cd ',
+  'rm ',
+  'rmdir ',
+  'ls ',
+  'mkdir ',
+  'mv ',
+  'cp ',
+  'cat ',
+  'echo ',
+  'touch ',
+  'chmod ',
+  'chown ',
+  'kill ',
+  'pkill ',
+  'ps ',
+  'source ',
+  'export ',
+  'git ',
+  'npm ',
+  'npx ',
+  'node ',
+  'python ',
+  'python3 ',
+  'bash ',
+  'sh ',
+  'zsh ',
+  'nohup ',
+  'curl ',
+  'wget ',
+  'tar ',
+  'find ',
+  'grep ',
+  'sed ',
+  'awk ',
+  'sudo ',
+  './',
+];
+
+/** shell 里的连接符/元字符（正常文件路径不会出现）。 */
+const SHELL_METACHARS = /(?:&&|\|\||[;|]|>>?|\$\(|`)/;
+
+/** 路径类参数名（归一化后）。 */
+const PATH_LIKE_PARAM_KINDS: ReadonlyArray<string> = ['path', 'filepath', 'filename', 'file'];
+
+/** 命令执行类参数名（归一化后）—— 用来在客户端工具里找「命令执行工具」。 */
+const COMMAND_PARAM_KINDS: ReadonlyArray<string> = ['command', 'cmd', 'script', 'shell'];
+
+/**
+ * 值是否**明显是 shell 命令**而不是文件路径。
+ *
+ * 判据（保守，宁可漏判也不误判 —— 误判会把一条普通路径当命令执行）：
+ * 1. 以命令动词 + 空格开头（`cd /x && ./start.sh` / `ls -la`）；或
+ * 2. 以 `./` 开头（运行脚本的写法）；
+ * 3. 否则：以 `/`、`~` 开头的一律当路径；其余只有含 `&&`/`;`/`|`/`>`/反引号/`$(` 才算命令。
+ */
+export function looksLikeShellCommand(value: string | null | undefined): boolean {
+  const v = (value ?? '').trim();
+  if (!v || v.length > 2000) return false;
+  if (SHELL_COMMAND_PREFIXES.some((p) => v.startsWith(p))) return true;
+  if (v.startsWith('/') || v.startsWith('~')) return false;
+  return SHELL_METACHARS.test(v);
+}
+
+/** 一次「命令误填进路径参数」的改派记录（调用方负责打日志）。 */
+export interface CommandMisroute {
+  from: string;
+  to: string;
+  /** 被当成路径传进来的命令原文（截断，仅用于日志）。 */
+  commandPreview: string;
+}
+
+/**
+ * 把「拿文件路径参数当命令用」的调用改派给客户端的命令执行工具。
+ *
+ * ## 真实事故（2026-10-14，xzh 实测）
+ * 模型想跑 `cd /home/amble/object/btc && ./start.sh`，却把它塞进 `write_file` 的
+ * `path` 参数 → 客户端**真的在工作目录里创建了一个名叫 `cd /home/...` 的文件**，
+ * 下一轮又用 `rm -f` / `rmdir 'cd'` 去收拾自己造的垃圾，任务彻底跑偏。
+ *
+ * ## 规则（保守：只在能确定时动手）
+ * 1. 只看**路径类**参数的值（`path` / `file_path` / `filePath` / `filename` / `file`）；
+ * 2. 值必须明显是 shell 命令（见 {@link looksLikeShellCommand}）；
+ * 3. 客户端声明的工具里**恰好有一个**带 `command`/`cmd`/`script`/`shell` 参数的工具
+ *    → 把命令原文改派给它（其余参数不必带过去：它们本来就是误填的）；
+ *    **0 个或 ≥2 个候选都不动手**（猜错比让客户端拒绝更糟）。
+ *
+ * @returns 修好的调用数组 + 改派记录（调用方负责打日志）
+ */
+export function rerouteCommandMisuse(
+  toolCalls: ReadonlyArray<ToolCallPayload> | null | undefined,
+  tools: ReadonlyArray<ToolDefinition> | null | undefined,
+): { repaired: ToolCallPayload[]; reroutes: CommandMisroute[] } {
+  if (!toolCalls || toolCalls.length === 0) return { repaired: [], reroutes: [] };
+  if (!tools || tools.length === 0) return { repaired: [...toolCalls], reroutes: [] };
+
+  // 找「命令执行工具」：恰好一个候选才动手
+  const candidates: Array<{ name: string; param: string }> = [];
+  const declared = new Set<string>();
+  for (const tool of tools) {
+    const name = toolNameOf(tool);
+    if (!name) continue;
+    declared.add(name);
+
+    const props = Object.keys(tool?.function?.parameters?.properties ?? {});
+    const hit = props.find((p) => COMMAND_PARAM_KINDS.includes(normalizeParamKey(p)));
+    if (hit) candidates.push({ name, param: hit });
+  }
+
+  const target = candidates.length === 1 ? candidates[0] : undefined;
+
+  const repaired: ToolCallPayload[] = [];
+  const reroutes: CommandMisroute[] = [];
+
+  for (const tc of toolCalls) {
+    const name = tc.function?.name ?? '';
+    const args = parseArgs(tc);
+
+    // 没有唯一的命令执行工具（或名字不由客户端声明）→ 不碰
+    if (!target || !args || !declared.has(name) || name === target.name) {
+      repaired.push(tc);
+      continue;
+    }
+
+    const misuse = Object.entries(args).find(
+      ([key, value]) =>
+        PATH_LIKE_PARAM_KINDS.includes(normalizeParamKey(key)) &&
+        typeof value === 'string' &&
+        looksLikeShellCommand(value),
+    );
+    if (!misuse) {
+      repaired.push(tc);
+      continue;
+    }
+
+    const command = String(misuse[1]);
+    reroutes.push({ from: name, to: target.name, commandPreview: command.slice(0, 120) });
+    repaired.push({
+      ...tc,
+      function: {
+        ...tc.function,
+        name: target.name,
+        arguments: JSON.stringify({ [target.param]: command }),
+      },
+    });
   }
 
   return { repaired, reroutes };

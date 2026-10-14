@@ -1,7 +1,7 @@
 /**
- * 两轮策略的「转换器」提示词 —— `legacy-python/src/utils/tool_calls.py` 的 `build_reparse_prompt`。
- *
- * 场景：第一轮让模型自由回复（生成代码/文档），第二轮让它把回复**原样**转成工具调用。
+ * 兜底轮的提示词 —— 原来是「两轮策略转换器」（`build_reparse_prompt`），
+ * 2026-10-14 与「自驱动续跑」「工具名纠正轮」合并成**唯一一层**动作恢复轮
+ * （见 `docs/native-parity.md`）。
  *
  * ⚠️ 关键踩坑（2026-09-2x）：工具名**必须取自客户端真实 tools**，绝不能硬编码
  * `Write` / `SearchReplace` / `Read`。实测客户端只提供 `list_dir`/`read_file`/`search_content`
@@ -10,111 +10,66 @@
  * 表现为「转换成功但 IDE 不执行」。
  */
 import type { ToolDefinition } from '../types/message.js';
-import { toolNameOf, toolParamNames, toolRequiredParams } from '../types/message.js';
-import { detectToolNames } from './names.js';
+import { toolNameOf, toolParamNames } from '../types/message.js';
 import { TOOL_CALL_CLOSE, TOOL_CALL_OPEN } from './protocol.js';
-import { PY_W_CHARS } from './repair.js';
 
-/** 匹配「疑似文件路径」的正则（用 PY_W_CHARS 以支持中文文件名）。 */
-const FILE_PATH_IN_TEXT = new RegExp(
-  String.raw`[/~][${PY_W_CHARS}./-]+\.[${PY_W_CHARS}]{1,10}`,
-  'gu',
-);
+/* ==================================================================== */
+/* 动作恢复轮（**唯一一层兜底**）                                      */
+/* ==================================================================== */
 
-/** 第一轮回复注入提示词时的截断长度。 */
-export const REPARSE_INPUT_MAX_LEN = 8000;
+/** 恢复轮里回放「上一轮回复」的长度上限。 */
+export const RECOVERY_ANSWER_MAX_LEN = 4000;
 
-/** 提示词里列出的真实路径上限。 */
-const MAX_CONTEXT_PATHS = 10;
-
-export interface BuildReparsePromptOptions {
-  /** 原始用户请求（提供上下文）。 */
-  userRequest?: string;
-  /** 对话历史文本（用于提取真实文件路径）。 */
-  conversationHistory?: string;
+export interface BuildActionRecoveryPromptOptions {
+  /** 上一轮的回复/思考正文（可能为空 —— 整轮只输出了一段 `<tool_call>` 块）。 */
+  answer?: string;
+  /** 上一轮里「客户端没有这个工具」的调用名（空数组表示「压根没给出调用」）。 */
+  invalidNames?: ReadonlyArray<string>;
+  /** 上一轮这些调用的原文（`name(arguments)`），让模型看清自己原本想调什么。 */
+  invalidCalls?: ReadonlyArray<string>;
+  /** 「最近进展」文本（`formatRecentProgress()` 的产出）。 */
+  recentProgress?: string;
   /** 当前工作目录；默认取 `process.cwd()`（对应 Python 的 `os.getcwd()`）。 */
   currentWorkingDir?: string;
 }
 
 /**
- * 构造第二轮的「文本 → 工具调用」转换提示词。
+ * 构造**唯一一层**兜底的提示词：逼模型把「下一步」变成真实的工具调用。
  *
- * @param firstResponse 第一轮的文本回复
- * @param tools 客户端真实工具列表
+ * ## 为什么只有一层（2026-10-14 重构）
+ * 原来有**三套**独立兜底，最坏会串起来跑 2~3 轮额外对话（每轮实测 30~98s）：
+ * - 「两轮策略 reparse」：本轮没有任何工具调用 → 让模型把文字转成调用；
+ * - 「自驱动续跑」：回答像计划书（只说不做）→ 再驱动一轮；
+ * - 「工具名纠正轮」：调了客户端没有的工具（如平台自带的 `execute_sandbox_code`）→ 纠正。
+ * 三者的**触发条件互斥、提示词高度重叠**，合并成一个 directive 提示词即可，
+ * 且总成本封顶为**一轮**（见 `docs/native-parity.md` 的「取舍与代价」）。
+ *
+ * ⚠️ 与 `buildReparsePrompt` 同样的铁律：**工具名/参数名只能取自客户端真实 tools**，
+ * 绝不在提示词里硬编码任何工具名。
  */
-export function buildReparsePrompt(
-  firstResponse: string,
+export function buildActionRecoveryPrompt(
   tools: ReadonlyArray<ToolDefinition>,
-  options: BuildReparsePromptOptions = {},
+  options: BuildActionRecoveryPromptOptions = {},
 ): string {
   const {
-    userRequest = '',
-    conversationHistory = '',
+    answer = '',
+    invalidNames = [],
+    invalidCalls = [],
+    recentProgress = '',
     currentWorkingDir = process.cwd(),
   } = options;
 
-  // 只展示客户端**真实存在**的工具名，不设默认值
-  const detected = detectToolNames(tools);
-  const writeName = detected['write'] ?? '';
-  const editName = detected['edit'] ?? '';
+  const names = [...new Set(invalidNames.map((n) => (n ?? '').trim()).filter(Boolean))];
+  const namesText = names.map((n) => `\`${n}\``).join(', ');
 
-  const allNames = tools.map((t) => toolNameOf(t)).filter(Boolean);
-  const namesText = allNames.length > 0 ? allNames.join(', ') : '（见下方可用工具）';
+  // 问题定性：调错名字 vs 压根没动手（两者的「必须做的事」是一样的）
+  const problem = names.length
+    ? `你调用了**本环境不存在的工具**：${namesText}。\n` +
+      '那些名字属于网页平台自带的工具（代码沙箱 / 联网搜索之类），本地客户端**没有提供**，' +
+      '调用无效 —— 那一轮什么都不会被执行。'
+    : '你上一轮**没有给出可执行的工具调用**（只有文字/计划），这在当前环境下是无效回复。';
 
-  // 文件类操作建议：只在客户端确实提供了对应工具时才给
-  const fileOpRules: string[] = [];
-  if (editName && writeName) {
-    fileOpRules.push(
-      `- **如果文件已存在（之前 Read 过），必须用 ${editName} 修改，不要用 ${writeName} 覆盖**`,
-    );
-    fileOpRules.push(`- 如果文件不存在，用 ${writeName} 创建`);
-    fileOpRules.push(`- ${editName} 的 old_str 必须是文件中真实存在的代码片段`);
-  }
-
-  // 示例：只展示真实存在的工具 + 真实参数名
-  const examples: string[] = [];
-  if (writeName) {
-    examples.push(
-      `${TOOL_CALL_OPEN}\n` +
-        `{"name": "${writeName}", "arguments": {"file_path": "<此处填写真实文件路径>", ` +
-        `"content": "<此处填写真实文件内容>"}}\n` +
-        TOOL_CALL_CLOSE,
-    );
-  }
-  if (editName) {
-    examples.push(
-      `${TOOL_CALL_OPEN}\n` +
-        `{"name": "${editName}", "arguments": {"file_path": "<此处填写真实文件路径>", ` +
-        `"old_str": "<此处填写文件中已存在的原文>", "new_str": "<此处填写替换后的新文本>"}}\n` +
-        TOOL_CALL_CLOSE,
-    );
-  }
-  if (examples.length === 0 && tools.length > 0) {
-    // 客户端没有写/改文件类工具（例如只有 list_dir / read_file / search_content）
-    const first = tools[0] as ToolDefinition;
-    const firstName = toolNameOf(first) || '工具名';
-    const required = toolRequiredParams(first);
-    const props = toolParamNames(first);
-
-    const sampleArgs: Record<string, string> = {};
-    for (const p of required.length > 0 ? required : props.slice(0, 2)) {
-      sampleArgs[p] = `<${p} 的真实取值>`;
-    }
-    examples.push(
-      `${TOOL_CALL_OPEN}\n` +
-        `{"name": "${firstName}", "arguments": ${JSON.stringify(sampleArgs)}}\n` +
-        TOOL_CALL_CLOSE,
-    );
-  }
-  const examplesText = examples.join('\n\n');
-
-  // 截断过长的第一轮回复（避免占用输入框额度）
-  let truncated = firstResponse.slice(0, REPARSE_INPUT_MAX_LEN);
-  if (firstResponse.length > REPARSE_INPUT_MAX_LEN) {
-    truncated += '\n\n[... 内容已截断 ...]';
-  }
-
-  // 工具清单只列名称与参数名（长描述会干扰第二轮）
+  // 工具清单只列名称与参数名（长描述会干扰这一轮）
   const toolLines = tools.map((tool) => {
     const name = toolNameOf(tool);
     const params = toolParamNames(tool).join(', ');
@@ -122,70 +77,34 @@ export function buildReparsePrompt(
     const shortDesc = desc.length > 60 ? `${desc.slice(0, 60)}...` : desc;
     return `- ${name}(${params}): ${shortDesc}`;
   });
-  const toolsSummary = toolLines.join('\n');
 
-  // 从历史 / 请求 / 回复里收集真实路径，避免模型照抄占位路径
-  const contextPaths = new Set<string>();
-
-  if (conversationHistory) {
-    for (const m of conversationHistory.matchAll(/"file_path"\s*:\s*"([^"]+)"/gu)) {
-      const p = m[1] as string;
-      if (p && !p.startsWith('http') && p.length < 200) contextPaths.add(p);
-    }
-    for (const m of conversationHistory.matchAll(FILE_PATH_IN_TEXT)) {
-      const p = m[0];
-      if (!p.startsWith('http') && p.length < 200) contextPaths.add(p);
-    }
+  const trimmedAnswer = answer.trim();
+  let shownAnswer = trimmedAnswer.slice(0, RECOVERY_ANSWER_MAX_LEN);
+  if (trimmedAnswer.length > RECOVERY_ANSWER_MAX_LEN) {
+    shownAnswer += '\n\n[... 内容已截断 ...]';
   }
+  const answerBlock = shownAnswer ? `\n[你上一轮的回复]\n${shownAnswer}\n` : '';
+  const callsBlock = invalidCalls.length > 0 ? `\n[你上一轮实际输出的调用]\n${invalidCalls.join('\n')}\n` : '';
+  const progressBlock = recentProgress ? `\n# 最近进展（对话尾部）\n${recentProgress}\n` : '';
 
-  for (const src of [userRequest, firstResponse]) {
-    for (const m of src.matchAll(FILE_PATH_IN_TEXT)) {
-      const p = m[0];
-      if (!p.startsWith('http') && p.length < 200) contextPaths.add(p);
-    }
-  }
+  return `你上一轮没有推进任务。${problem}
 
-  const contextPathsHint =
-    contextPaths.size > 0
-      ? '\n\n**对话中提到的真实文件路径**（必须使用这些路径，不要编造）：\n' +
-        [...contextPaths]
-          .sort()
-          .slice(0, MAX_CONTEXT_PATHS)
-          .map((p) => `  - ${p}`)
-          .join('\n')
-      : '';
+[现在必须做的事]
+1. **只输出工具调用**（${TOOL_CALL_OPEN}...${TOOL_CALL_CLOSE}），不要任何解释、计划、清单、总结，
+   也不要复述本段文字。
+2. 把「下一步」换成下方清单里的**真实工具**：要执行代码/命令 → 用命令执行类工具；
+   要读文件 → 用读取类工具；要改文件 → 用修改/写入类工具。
+3. **禁止**输出清单以外的工具名${namesText ? `（尤其禁止 ${namesText}）` : ''}；
+   **禁止占位符**（如「真实文件路径」「文件内容」「<...>」），file_path 用真实绝对路径。
+4. 不需要再问、不要再确认——直接调用。
+5. **不要重复已经执行过的同一条调用**（同工具 + 同参数）；
+   如果事实上已经没有新动作可做，就只输出一行文字：\`任务已完成。\`
 
-  let workingDirHint = `\n\n**当前工作目录**：\`${currentWorkingDir}\`\n`;
-  workingDirHint +=
-    contextPaths.size > 0
-      ? '**重要**：file_path 必须使用上述对话中提到的真实路径，不要编造路径。如果不确定路径，使用当前工作目录下的相对路径。'
-      : '**重要**：如果对话中没有提到具体路径，使用当前工作目录下的相对路径或绝对路径。';
+# 本次可用的真实工具（只有这些可用）
+${toolLines.join('\n')}
 
-  return `你是一个工具调用转换器。请将以下AI回复内容转换为工具调用格式。
-
-**严格要求**：
-- 只输出 ${TOOL_CALL_OPEN}...${TOOL_CALL_CLOSE} 格式的工具调用
-- 不要输出任何解释、描述或额外文字
-- **绝对禁止输出占位符/示例文本**：不得出现「真实文件路径」「文件内容」「要替换的代码」「新代码」「<...>」等字样，这些只是格式说明，不是真实值
-- **file_path 必须是具体的、真实存在的文件路径**（取自下方"对话中提到的真实文件路径"或"当前工作目录"）
-- **content / old_str / new_str 必须来自 AI 回复中的真实内容**，不得编造
-${fileOpRules.join('\n')}
-- **工具名必须严格取自下方「可用工具」列表，本次只有：${namesText}**
-- 不要输出列表之外的工具名（例如客户端没有 Write / SearchReplace 时绝不能输出它们）
-${contextPathsHint}
-${workingDirHint}
-
-# 可用工具
-${toolsSummary}
-
-# 输出格式（仅示意 JSON 结构；尖括号 <> 内为需要你替换的说明，禁止原样输出尖括号内容）
-${examplesText}
-
-# 用户原始请求
-${userRequest}
-
-# AI的回复（需要转换为工具调用）
-${truncated}
-
-现在输出工具调用（file_path 必须是真实路径，禁止输出「真实文件路径」等占位符）：`;
+# 当前工作目录
+\`${currentWorkingDir}\`
+${progressBlock}${answerBlock}${callsBlock}
+现在输出工具调用：`;
 }

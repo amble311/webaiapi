@@ -324,3 +324,4 @@ describe('主轮全局（_last_raw_sse_*）', () => {
     expect(getLastRawSse()).toEqual({ text: '', think: '', toolCalls: [] });
   });
 });
+

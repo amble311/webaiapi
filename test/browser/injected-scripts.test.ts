@@ -4,9 +4,12 @@ import { SSE_CAPTURE_JS } from '../../src/browser/sse-capture.js';
 import { STEALTH_JS } from '../../src/browser/stealth.js';
 
 /**
- * 这两个脚本是从 Python 版**逐字节抽取**的（见 docs/migration-status.md），
- * 不应该被手工改写。这里只做「关键能力还在不在」的体检 ——
+ * 这两个脚本都是从 Python 版**逐字节抽取**的（见 docs/migration-status.md），
+ * 不应该被随意改写。这里只做「关键能力还在不在」的体检 ——
  * 一旦有人误删/误改，能立刻发现，而不是等到线上出现「正文乱码」才察觉。
+ *
+ * ⚠️ `SSE_CAPTURE_JS` 自 2026-10-14 起**不再是逐字节一致**：为侦察「平台请求体是否接受
+ * 客户端工具定义」，追加了请求体捕获（`__glmSSEBodiesGet`）。`STEALTH_JS` 仍然一致。
  */
 describe('SSE_CAPTURE_JS', () => {
   it('非空且是立即执行函数', () => {
@@ -31,6 +34,16 @@ describe('SSE_CAPTURE_JS', () => {
     expect(SSE_CAPTURE_JS).toContain('_looksLikeStream');
     expect(SSE_CAPTURE_JS).toContain('event-stream');
     expect(SSE_CAPTURE_JS).toContain('TextDecoder');
+  });
+
+  it('⭐ 侦察能力：同时抓「请求体」（判断平台是否接受客户端工具定义）', () => {
+    // 2026-10-14：要回答「能否用平台原生函数调用通道承载客户端工具」，
+    // 必须看到页面自己发出去的请求体长什么样。
+    expect(SSE_CAPTURE_JS).toContain('window.__glmSSEBodiesGet');
+    expect(SSE_CAPTURE_JS).toContain('_record');
+    expect(SSE_CAPTURE_JS).toContain('init.body');
+    expect(SSE_CAPTURE_JS).toContain('getRequestHeader');
+    expect(SSE_CAPTURE_JS).toContain('reqs');
   });
 });
 

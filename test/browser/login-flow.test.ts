@@ -233,7 +233,7 @@ describe('readExistingAccounts', () => {
   let dir: string;
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), 'wbai-login-'));
+    dir = mkdtempSync(join(tmpdir(), 'webapi-login-'));
   });
 
   afterEach(() => {

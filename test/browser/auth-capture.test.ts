@@ -17,7 +17,7 @@ describe('AuthCapture.saveAs', () => {
   let dir: string;
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), 'wbai-capture-'));
+    dir = mkdtempSync(join(tmpdir(), 'webapi-capture-'));
   });
 
   afterEach(() => {

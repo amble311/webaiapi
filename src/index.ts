@@ -133,8 +133,8 @@ export {
   looksLikeFilepath,
 } from './tools/convert.js';
 
-export { REPARSE_INPUT_MAX_LEN, buildReparsePrompt } from './tools/prompts.js';
-export type { BuildReparsePromptOptions } from './tools/prompts.js';
+export { RECOVERY_ANSWER_MAX_LEN, buildActionRecoveryPrompt } from './tools/prompts.js';
+export type { BuildActionRecoveryPromptOptions } from './tools/prompts.js';
 
 /* ---------------- 浏览器层（M2） ---------------- */
 
@@ -275,8 +275,6 @@ export {
 export {
   BROWSER_PROMPT_MAX_LEN,
   COMPRESS_MIN_BUDGET,
-  REPARSE_MAX_BUDGET,
-  REPARSE_MIN_BUDGET,
   TOOL_ROUND_LIMIT,
   TOTAL_TIME_BUDGET,
   buildUsage,
@@ -284,6 +282,7 @@ export {
   estimateTokens,
   extractUserQuestion,
   formatHistoryContext,
+  formatRecentProgress,
   getSessionDelta,
   isReadOnlyTool,
   looksUnfinishedAnswer,

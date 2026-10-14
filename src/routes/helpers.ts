@@ -123,6 +123,100 @@ export function extractUserQuestion(messages: ReadonlyArray<ChatMessage | Messag
 export type MessageDictLike = Record<string, unknown>;
 
 /* ==================================================================== */
+/* 转换轮 / 续跑轮的材料准备                                            */
+/* ==================================================================== */
+
+/**
+ * 模型对「网页平台自带工具」的自我纠结 —— 出现在材料里只会把转换轮带沟里。
+ *
+ * ⚠️ 2026-10-14 实测：主轮被平台 `open`/`search` 劫持后（单轮调 `open` 52 次），
+ * 回答与思考里全是这类句子：
+ * 「浏览器工具已确认不可用」「open 工具已达到上限，应该停止调用」「已严格遵守系统指令，
+ * 停止 search 调用」「搜索结果与本任务无关，忽略」。把它们原样交给转换轮，
+ * **同一个 ChatGLM** 会跟着再去调 open/search，又白烧掉 90s（实测 0 工具调用）。
+ */
+const PLATFORM_TOOL_NOISE_RE =
+  /(浏览器工具|open\s*工具|search\s*工具|搜索结果|联网搜索|停止调用|停止\s*(?:search|open)|(?:已达|达到|超过)\s*上限|严格遵守系统指令|系统提醒|本任务是纯本地工程任务|立即用\s*bash\s*推进|直接用\s*bash\s*完成|改用\s*bash)/i;
+
+/**
+ * 剔掉「平台自带工具」的议论句，保留模型真正想做的事。
+ *
+ * 粒度是**句子**而不是整行：同一行里既有议论又有实质（例如「浏览器工具不可用；用 bash 删除
+ * /a/b」）时，只丢议论那一句，绝不整行丢 —— 否则会连着真命令一起丢掉。
+ */
+export function stripPlatformToolNoise(text: string): string {
+  if (!text) return '';
+
+  const out: string[] = [];
+  for (const rawLine of text.split('\n')) {
+    const line = rawLine.trim();
+    if (!line) {
+      out.push('');
+      continue;
+    }
+
+    // 按句末标点切分（保留标点），只剔除命中的句子
+    const kept = line
+      .split(/(?<=[。！？!?；;])/)
+      .filter((sentence) => sentence.trim() && !PLATFORM_TOOL_NOISE_RE.test(sentence))
+      .join('')
+      .trim();
+
+    if (kept) out.push(kept);
+  }
+
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/** 单条进展的截断长度。 */
+function clip(text: string, maxLen: number): string {
+  return text.length > maxLen ? `${text.slice(0, maxLen)}…` : text;
+}
+
+/**
+ * 从消息列表**尾部**抽取「最近进展」，给转换轮当上下文。
+ *
+ * ⚠️ 2026-10-14：转换轮原来只有「模型自己的自言自语 + 一个取错的用户请求」，
+ * 完全不知道进行到哪了（上一轮写了哪个文件、跑过什么命令），自然转不出正确的下一步。
+ * `buildReparsePrompt` 的 `conversationHistory` 只被用来**抽文件路径**，从没展示给模型。
+ *
+ * @param messages 完整消息列表（越靠后越新）
+ * @returns 形如 `用户: …` / `AI 调用工具: write_file` / `工具结果: 已写入 …` 的多行文本
+ */
+export function formatRecentProgress(
+  messages: ReadonlyArray<ChatMessage | MessageDictLike>,
+  options: { maxEntries?: number; maxCharsPerEntry?: number; maxTotalChars?: number } = {},
+): string {
+  const { maxEntries = 8, maxCharsPerEntry = 240, maxTotalChars = 1600 } = options;
+
+  const lines: string[] = [];
+  for (let i = messages.length - 1; i >= 0 && lines.length < maxEntries; i -= 1) {
+    const md = messageToDict(messages[i] as ChatMessage);
+    const role = md.role;
+    const text = getTextContent(md.content).replace(/\s+/g, ' ').trim();
+    const rawToolCalls = md.tool_calls;
+    const names = Array.isArray(rawToolCalls)
+      ? rawToolCalls.map((tc) => tc?.function?.name ?? '?')
+      : [];
+
+    if (role === 'user' && text) {
+      lines.push(`用户: ${clip(text, maxCharsPerEntry)}`);
+    } else if (role === 'assistant' && names.length > 0) {
+      const note = text ? `（旁白: ${clip(text, 80)}）` : '';
+      lines.push(`AI 调用工具: ${names.join(', ')}${note}`);
+    } else if (role === 'assistant' && text) {
+      lines.push(`AI: ${clip(text, maxCharsPerEntry)}`);
+    } else if ((role === 'tool' || role === 'function') && text) {
+      lines.push(`工具结果: ${clip(text, maxCharsPerEntry)}`);
+    }
+  }
+
+  const ordered = lines.reverse().join('\n');
+  // 超出总预算时只保留**最近**的部分
+  return ordered.length > maxTotalChars ? ordered.slice(-maxTotalChars) : ordered;
+}
+
+/* ==================================================================== */
 /* 预算常量（互相有约束关系，改前务必读完注释）                        */
 /* ==================================================================== */
 
@@ -148,23 +242,6 @@ export const BROWSER_PROMPT_MAX_LEN = 64000;
 export const TOTAL_TIME_BUDGET = 270.0;
 
 /**
- * 两轮策略（reparse）至少要有多少剩余时间才值得启动。
- *
- * 转换器那轮本身需要模型再生成一次（实测 20~120s），剩余太少时
- * 直接放行首轮的文本回答，比超时后什么都拿不到更有用。
- */
-export const REPARSE_MIN_BUDGET = 60.0;
-
-/**
- * 两轮策略自身的耗时上限（秒）。
- *
- * 实测 reparse 有可能一直「思考」到被总预算掐断却什么都没产出
- * （一次烧掉 140s，仍然 0 个工具调用）。给它独立上限，失败时能更快
- * 把首轮的文本回答还给客户端。
- */
-export const REPARSE_MAX_BUDGET = 90.0;
-
-/**
  * 历史压缩的预算门槛（秒）。
  *
  * 「压缩历史」不是免费的：一份 8 万字符的提示词要压缩 2 次，每次都是一轮完整对话，
@@ -178,7 +255,13 @@ export const COMPRESS_MIN_BUDGET = 170.0;
 /** 单块压缩的时间上限（秒），避免无限等待。 */
 export const COMPRESS_CHUNK_MAX_SECONDS = 60.0;
 
-/** 自驱动续跑至少要留多少剩余预算（一轮完整对话，比 reparse 稍多）。 */
+/**
+ * 动作恢复轮（**唯一一层兜底**）的预算：至少要留多少剩余时间才值得启动，以及它自己的上限。
+ *
+ * 实测一轮完整对话要 20~120s：门槛设得太低会启动一个**注定跑不完**的恢复轮
+ * （2026-10-14 实测：首轮烧掉 210s 后只剩 60s，恢复轮一直转到 270s 总预算耗尽，
+ * 客户端既没拿到工具调用还多等了 60s）。
+ */
 export const CONTINUE_MIN_BUDGET = 80.0;
 export const CONTINUE_MAX_BUDGET = 100.0;
 
@@ -215,7 +298,7 @@ export function isReadOnlyTool(name: string): boolean {
 }
 
 /* ==================================================================== */
-/* 自驱动续跑                                                          */
+/* 动作恢复轮的触发信号                                                 */
 /* ==================================================================== */
 
 /**
@@ -226,6 +309,9 @@ export function isReadOnlyTool(name: string): boolean {
  * 客户端收到纯文本即结束回合，用户看到「读了半天、一个文件都没改、任务终止」。
  * 模型还自认为「工具轮数已达上限（8/8）」（这句是它自己脑补的），
  * 于是主动放弃动手改成写计划。
+ *
+ * 现在它是「动作恢复轮」的触发信号之一（提示词见
+ * `tools/prompts.ts::buildActionRecoveryPrompt`，原 `CONTINUE_PROMPT` 已并入）。
  */
 export const UNFINISHED_MARKERS: ReadonlyArray<string> = [
   '需先补读', '需要先补读', '还需补读', '需补读', '补读',
@@ -240,27 +326,6 @@ export function looksUnfinishedAnswer(text: string): boolean {
   if (!text) return false;
   return UNFINISHED_MARKERS.some((m) => text.includes(m));
 }
-
-/** 自驱动续跑的提示词（`{answer}` / `{tools}` 两个占位符）。 */
-export const CONTINUE_PROMPT = `你上一轮的回复**只写了计划、没有动手**，这在当前环境下是无效回复。
-
-[你上一轮的回复]
-{answer}
-
-[现在必须做的事]
-1. **禁止**输出计划、清单、总结、说明文字、Markdown 表格。
-2. **不存在轮数上限**，也不要声称"已达上限""待下一轮""需要先补读"——
-   你随时可以继续调用工具。
-3. 立刻把你上面提到的「下一步」变成**真实的工具调用**：
-   - 需要看文件 → 调用读取文件工具（一次可以并行读多个，参数用真实绝对路径）；
-   - 需要改文件 → 直接调用修改/写入工具，给出完整的 old_str / new_str；
-   - 需要跑命令 → 调用执行命令工具。
-4. 只输出工具调用（<tool_call>…</tool_call> 或 <function_call>…</function_call>），
-   不要包含任何额外文字。
-
-[本次可用的真实工具]
-{tools}
-`;
 
 /* ==================================================================== */
 /* 回答跑偏检测                                                        */

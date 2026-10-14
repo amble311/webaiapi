@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * `wbai` 的可执行入口（`bin` 指向这里）。
+ * `webapi` 的可执行入口（`bin` 指向这里）。
  *
  * ## 为什么不让 `bin` 直接指向 `dist/cli.js`
  * `dist/` 是**构建产物且被 .gitignore 忽略**。全新 clone 之后、或通过
@@ -8,7 +8,7 @@
  * 指向它，用户看到的是 shell 的原始报错：
  *
  * ```
- * /bin/bash: 行 1: /usr/local/bin/wbai: 没有那个文件或目录
+ * /bin/bash: 行 1: /usr/local/bin/webapi: 没有那个文件或目录
  * ```
  *
  * —— 既没说"没构建"，也没说该怎么办。（实测确认过。）
@@ -19,7 +19,7 @@
  * ## ⚠️ 为什么要显式调用 `runCli()`，而不是只 import
  * `dist/cli.js` 里有一个「是否被直接执行」的守卫（比较 `process.argv[1]` 与
  * `import.meta.url` 的 realpath）。经本文件 import 时，`argv[1]` 是
- * `.../bin/wbai.mjs` 而 `import.meta.url` 是 `.../dist/cli.js` —— **两者不等**，
+ * `.../bin/webapi.mjs` 而 `import.meta.url` 是 `.../dist/cli.js` —— **两者不等**，
  * 守卫会判定"不是直接执行"从而**什么都不做**（静默失效，最难查的一类 bug）。
  * 因此这里必须显式调用导出的 `runCli()`。
  */
@@ -32,7 +32,7 @@ const cliPath = join(here, '..', 'dist', 'cli.js');
 
 if (!existsSync(cliPath)) {
   console.error(
-    '[wbai] 还没有构建，找不到 dist/cli.js。\n' +
+    '[webapi] 还没有构建，找不到 dist/cli.js。\n' +
       '       请先运行：  npm run build\n' +
       '       （若你是 clone 下来做开发的：npm install 会自动构建，\n' +
       '        该步骤由 package.json 的 `prepare` 脚本触发。）',

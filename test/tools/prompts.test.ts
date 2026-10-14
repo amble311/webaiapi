@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildReparsePrompt } from '../../src/tools/prompts.js';
+import { RECOVERY_ANSWER_MAX_LEN, buildActionRecoveryPrompt } from '../../src/tools/prompts.js';
 import type { ToolDefinition } from '../../src/types/message.js';
+
+/**
+ * 唯一一层兜底（动作恢复轮）的提示词。
+ *
+ * 原来有三套独立兜底：两轮策略 reparse / 自驱动续跑 / 工具名纠正轮，
+ * 2026-10-14 合并成这一轮（见 `docs/native-parity.md`）。
+ */
 
 /** CodeBuddy 风格：write_to_file / replace_in_file。 */
 const CODEBUDDY_TOOLS: ToolDefinition[] = [
@@ -43,94 +50,92 @@ const READONLY_TOOLS: ToolDefinition[] = [
   },
 ];
 
-describe('buildReparsePrompt', () => {
-  it('⚠️ 工具名清单只含客户端真实工具名', () => {
-    const prompt = buildReparsePrompt('AI 的第一轮回复', CODEBUDDY_TOOLS);
-    expect(prompt).toContain('本次只有：write_to_file, replace_in_file');
-    expect(prompt).toContain('# 可用工具');
+/** 有命令执行工具的客户端（`execute_sandbox_code` 事故场景）。 */
+const BASH_TOOLS: ToolDefinition[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'bash',
+      description: 'Run a shell command',
+      parameters: {
+        properties: { command: {}, timeout: {}, cwd: {} },
+        required: ['command'],
+      },
+    },
+  },
+  ...READONLY_TOOLS,
+];
+
+describe('buildActionRecoveryPrompt', () => {
+  it('⚠️ 工具清单只含客户端真实工具名，绝不硬编码', () => {
+    const prompt = buildActionRecoveryPrompt(CODEBUDDY_TOOLS);
+    expect(prompt).toContain('# 本次可用的真实工具（只有这些可用）');
     expect(prompt).toContain('- write_to_file(filePath, content): Write content to a file');
+    expect(prompt).toContain('- replace_in_file(filePath, old_str, new_str): Replace a snippet');
+    // 客户端没有的工具名一个字都不能出现
+    expect(prompt).not.toContain('SearchReplace');
+    expect(prompt).not.toContain('bash(');
   });
 
-  it('⚠️ 示例只用客户端真实存在的工具（不给客户端没有的 Write/SearchReplace 造示例）', () => {
-    const prompt = buildReparsePrompt('回复', CODEBUDDY_TOOLS);
-    expect(prompt).toContain('"name": "write_to_file"');
-    expect(prompt).toContain('"name": "replace_in_file"');
-    // 示例块里不能出现客户端没有的工具名
-    const examples = prompt.slice(prompt.indexOf('# 输出格式'), prompt.indexOf('# 用户原始请求'));
-    expect(examples).not.toContain('"name": "Write"');
-    expect(examples).not.toContain('"name": "SearchReplace"');
-  });
-
-  it('⚠️ 只读客户端场景：绝不让提示词教模型输出 Write / SearchReplace', () => {
-    // 这就是 2026-09-2x 的事故：旧提示词硬编码「工具名必须严格使用 read_file, Write, SearchReplace」，
-    // 转换器照着输出 → 客户端没这些工具 → 被 filterUnknownToolCalls 全部丢弃
-    const prompt = buildReparsePrompt('回复', READONLY_TOOLS);
-    const examples = prompt.slice(prompt.indexOf('# 输出格式'), prompt.indexOf('# 用户原始请求'));
-
-    expect(prompt).toContain('本次只有：list_dir, read_file');
-    expect(examples).not.toContain('"name": "Write"');
-    expect(examples).not.toContain('"name": "SearchReplace"');
-    // 用第一个真实工具 + 它真实的必填参数名给示例
-    expect(examples).toContain('"name": "list_dir"');
-    expect(examples).toContain('"path"');
-  });
-
-  it('文件类操作建议只在客户端确实提供写/改工具时才给', () => {
-    const withBoth = buildReparsePrompt('回复', CODEBUDDY_TOOLS);
-    expect(withBoth).toContain('必须用 replace_in_file 修改，不要用 write_to_file 覆盖');
-
-    const readonly = buildReparsePrompt('回复', READONLY_TOOLS);
-    expect(readonly).not.toContain('必须用 replace_in_file 修改');
-  });
-
-  it('注入用户原始请求与第一轮回复', () => {
-    const prompt = buildReparsePrompt('这是第一轮内容', CODEBUDDY_TOOLS, {
-      userRequest: '请创建配置文件',
+  it('⭐ 点名「客户端没有的工具」（原来由工具名纠正轮负责）', () => {
+    const prompt = buildActionRecoveryPrompt(BASH_TOOLS, {
+      invalidNames: ['execute_sandbox_code'],
+      invalidCalls: ['execute_sandbox_code({"code":"print(1)"})'],
+      answer: '我想跑一下 print(1) 确认环境',
+      currentWorkingDir: '/opt/proj',
     });
-    expect(prompt).toContain('# 用户原始请求\n请创建配置文件');
-    expect(prompt).toContain('# AI的回复（需要转换为工具调用）\n这是第一轮内容');
+
+    expect(prompt).toContain('`execute_sandbox_code`');
+    expect(prompt).toContain('本环境不存在的工具');
+    expect(prompt).toContain('[你上一轮实际输出的调用]\nexecute_sandbox_code({"code":"print(1)"})');
+    expect(prompt).toContain('[你上一轮的回复]\n我想跑一下 print(1) 确认环境');
+    expect(prompt).toContain('`/opt/proj`');
   });
 
-  it('第一轮回复超过 8000 字符时截断', () => {
-    const prompt = buildReparsePrompt('a'.repeat(9000), CODEBUDDY_TOOLS);
+  it('⭐ 没有调用时定性为「只有文字/计划」（原来由续跑与 reparse 负责）', () => {
+    const prompt = buildActionRecoveryPrompt(BASH_TOOLS, { answer: '我打算先看看目录' });
+    expect(prompt).toContain('没有给出可执行的工具调用');
+    expect(prompt).not.toContain('本环境不存在的工具');
+  });
+
+  it('⚠️ 只输出工具调用 + 禁占位符 + 禁复述（directive 风格，这一轮要快）', () => {
+    const prompt = buildActionRecoveryPrompt(BASH_TOOLS);
+    expect(prompt).toContain('**只输出工具调用**');
+    expect(prompt).toContain('禁止占位符');
+    expect(prompt).toContain('也不要复述本段文字');
+  });
+
+  it('带最近进展（转换轮据此知道做到哪了）', () => {
+    const prompt = buildActionRecoveryPrompt(BASH_TOOLS, {
+      recentProgress: '用户: 把服务重启一下\nAI 调用工具: write_file',
+    });
+    expect(prompt).toContain('# 最近进展（对话尾部）');
+    expect(prompt).toContain('AI 调用工具: write_file');
+  });
+
+  it('多个无效工具名去重后点名', () => {
+    const prompt = buildActionRecoveryPrompt(BASH_TOOLS, {
+      invalidNames: ['execute_sandbox_code', 'execute_sandbox_code', 'browser_search'],
+    });
+    expect(prompt).toContain('`execute_sandbox_code`, `browser_search`');
+  });
+
+  it('正文为空（整轮只有工具调用块）时也不崩', () => {
+    const prompt = buildActionRecoveryPrompt(BASH_TOOLS, { invalidNames: ['x'] });
+    expect(prompt).not.toContain('[你上一轮的回复]');
+    expect(prompt).not.toContain('[你上一轮实际输出的调用]');
+    expect(prompt).toContain('现在输出工具调用：');
+  });
+
+  it('回放的正文超长时截断', () => {
+    const prompt = buildActionRecoveryPrompt(BASH_TOOLS, { answer: 'a'.repeat(5000) });
     expect(prompt).toContain('[... 内容已截断 ...]');
-    expect(prompt).not.toContain('a'.repeat(8001));
-  });
-
-  it('注入当前工作目录', () => {
-    const prompt = buildReparsePrompt('回复', CODEBUDDY_TOOLS, {
-      currentWorkingDir: '/opt/my_service',
-    });
-    expect(prompt).toContain('**当前工作目录**：`/opt/my_service`');
-  });
-
-  it('从对话历史/请求/回复里收集真实路径并注入（最多 10 条）', () => {
-    const prompt = buildReparsePrompt('我改了 /opt/proj/src/a.ts', CODEBUDDY_TOOLS, {
-      userRequest: '看下 /opt/proj/src/b.ts',
-      conversationHistory: '工具结果：file_path: /opt/proj/src/c.ts',
-    });
-
-    expect(prompt).toContain('**对话中提到的真实文件路径**');
-    expect(prompt).toContain('- /opt/proj/src/a.ts');
-    expect(prompt).toContain('- /opt/proj/src/b.ts');
-    expect(prompt).toContain('- /opt/proj/src/c.ts');
-  });
-
-  it('没有路径时给出相对路径的兜底指引', () => {
-    const prompt = buildReparsePrompt('回复', CODEBUDDY_TOOLS, { currentWorkingDir: '/tmp' });
-    expect(prompt).not.toContain('**对话中提到的真实文件路径**');
-    expect(prompt).toContain('如果对话中没有提到具体路径');
-  });
-
-  it('包含禁止输出占位符的强指令', () => {
-    const prompt = buildReparsePrompt('回复', CODEBUDDY_TOOLS);
-    expect(prompt).toContain('绝对禁止输出占位符/示例文本');
-    expect(prompt).toContain('不得编造');
+    expect(prompt).not.toContain('a'.repeat(RECOVERY_ANSWER_MAX_LEN + 1));
   });
 
   it('客户端没有任何工具时也不崩', () => {
-    const prompt = buildReparsePrompt('回复', [], { currentWorkingDir: '/tmp' });
-    expect(prompt).toContain('（见下方可用工具）');
-    expect(prompt).toContain('# 用户原始请求');
+    const prompt = buildActionRecoveryPrompt([], { currentWorkingDir: '/tmp' });
+    expect(prompt).toContain('# 本次可用的真实工具（只有这些可用）');
+    expect(prompt).toContain('`/tmp`');
   });
 });

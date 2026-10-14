@@ -1,7 +1,7 @@
 {
   "name": "webaiapi",
   "version": "0.1.0",
-  "description": "把国产 AI 聊天网页（ChatGLM）包装成 OpenAI 兼容 API —— Playwright Firefox 纯浏览器自动化。命令名：wbai",
+  "description": "把国产 AI 聊天网页（ChatGLM）包装成 OpenAI 兼容 API —— Playwright Firefox 纯浏览器自动化。命令名：webapi",
   "keywords": [
     "openai",
     "api-gateway",
@@ -10,7 +10,7 @@
     "browser-automation",
     "llm",
     "cli",
-    "wbai"
+    "webapi"
   ],
   "license": "MIT",
   "type": "module",
@@ -18,7 +18,7 @@
     "node": ">=20.11"
   },
   "bin": {
-    "wbai": "bin/wbai.mjs"
+    "webapi": "bin/webapi.mjs"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -56,5 +56,14 @@
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vitest": "^5.0.4"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/amble311/webaiapi.git"
+  },
+  "homepage": "https://github.com/amble311/webaiapi#readme",
+  "bugs": {
+    "url": "https://github.com/amble311/webaiapi/issues"
+  },
+  "author": "amble311"
 }

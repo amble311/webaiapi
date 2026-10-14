@@ -42,9 +42,10 @@ import { listAccounts, loadAuth } from '../browser/credentials.js';
 import { iife } from '../browser/js-eval.js';
 import { logger } from '../log/logger.js';
 import { Mutex } from '../utils/mutex.js';
-import { sanitizeMessage } from '../utils/text.js';
+import { sanitizeMessage, topLevelJsonFields } from '../utils/text.js';
 import { type ChatRequest, type ChatResponse, BaseProvider } from './base.js';
 import {
+  APPLY_CHAT_PREFS_JS,
   BUSY_NOTICE_DIAG_JS,
   CLEAR_INPUT_JS,
   COUNT_CONVERSATION_ITEMS_JS,
@@ -58,8 +59,10 @@ import {
   INPUT_VALUE_LEN_JS,
   IS_INPUT_CLEARED_JS,
   PAGE_SHOWS_BUSY_JS,
+  PROBE_CHAT_TOGGLES_JS,
   PROBE_LOGGED_IN_JS,
   READ_BUSY_NOTICE_JS,
+  REQUEST_BODIES_GET_JS,
   RESET_SSE_JS,
   SEND_BUTTON_SELECTORS,
   SSE_GET_JS,
@@ -94,6 +97,19 @@ function sleep(ms: number): Promise<void> {
 
 /** SSE 原文落盘目录（排查上游格式 / 提取保真度用）。 */
 const SSE_LOG_DIR = 'logs';
+
+
+/** 从平台 ask 请求体里取 `meta_data`（解析失败返回空对象）。 */
+function askMetaDataOf(body: string): Record<string, unknown> {
+  try {
+    const parsed: unknown = JSON.parse(body);
+    if (!parsed || typeof parsed !== 'object') return {};
+    const meta = (parsed as Record<string, unknown>)['meta_data'];
+    return meta && typeof meta === 'object' ? (meta as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
 
 /** 安全取字符串（`context` 是 `Record<string, unknown>`）。 */
 function asString(value: unknown): string | undefined {
@@ -206,6 +222,21 @@ export class ChatGLMBrowserProvider extends BaseProvider {
    * 取 64K：留出安全余量，同时尽量保留上下文。
    */
   private readonly MAX_INPUT_LEN = 64000;
+
+  /**
+   * 「平台自带搜索刷屏」的提前收尾阈值：本轮平台 search `≥ 次数` 且已等待 `> 秒数`。
+   *
+   * ⚠️ 2026-10-14 实测：模型把「bash 怎么删带空格的目录」当成需要检索的知识问题，
+   * 单轮在 ChatGLM 自带的 search 上刷了 **57 次**（45 个不同 query），耗掉 210s，
+   * 最后只吐出一段复述提示词的纯文本（零客户端工具调用）。
+   * 平台搜索对本地代码任务**永远没有价值**，而它一旦开始刷，等得越久亏得越多 ——
+   * 更致命的是把总预算吃光，让后面的 reparse / 续跑兜底没预算可用。
+   */
+  private static readonly PLATFORM_SEARCH_GIVEUP_COUNT = 3;
+  private static readonly PLATFORM_SEARCH_GIVEUP_SECONDS = 90;
+
+  /** 页面开关探测是否已做过（每进程一次，见 {@link probeChatToggles}）。 */
+  private togglesProbed = false;
 
   /* ---------------- 登录状态缓存 ---------------- */
 
@@ -689,10 +720,26 @@ export class ChatGLMBrowserProvider extends BaseProvider {
     // 发送前清空 SSE 捕获缓冲，确保抓到的只是本轮回答
     await this.resetSseCapture();
 
+    /* 发送前把平台自带的「联网搜索」关掉、把「思考强度」降到「快速」。
+     * 理由：默认 is_networking=true + reasoning_effort=max 会让模型每轮刷几十次平台搜索、
+     * 并「想」上 90~200s（见 docs/native-parity.md 阶段 3）。幂等，失败不影响本轮。 */
+    await this.applyChatPreferences();
+
     // sessionKey 无论复用与否都要记：发完整提示词时这个会话也被「喂满」了，
     // 下一次同会话的请求同样可以只发增量。
     await this.sendMessage(messageContent, sessionKey, Boolean(deltaMsg && canReuse));
     logger.info('[chatglm] 消息已发送，等待 AI 回复...');
+
+    /* 侦察：把「平台自己的请求体」导出来（判断能否用平台原生函数调用通道承载客户端工具）。
+     * 只读、只落盘 + 打日志，失败一律不影响主流程。 */
+    if (this.ownsGlobals) await this.dumpPlatformRequests();
+
+    /* 侦察：找出「联网搜索 / 深度思考」的页面开关（决定能否在发送前关掉它们）。
+     * 每进程一次，落盘 `logs/chatglm_page_toggles.txt`。 */
+    if (this.ownsGlobals && !this.togglesProbed) {
+      this.togglesProbed = true;
+      await this.probeChatToggles();
+    }
 
     let lastText = '';
     let maxLenSeen = 0; // DOM 兜底路径下提取到的最长文本长度
@@ -906,6 +953,22 @@ export class ChatGLMBrowserProvider extends BaseProvider {
           }
         }
 
+        /* ===== 平台自带搜索刷屏 → 提前收尾 =====
+         * 见 PLATFORM_SEARCH_GIVEUP_COUNT 的说明：留着它只会白烧预算，
+         * 而预算恰恰是后面 reparse / 续跑兜底唯一的本钱。 */
+        const platformSearchCount =
+          (platformToolStats['search'] ?? 0) + (platformToolStats['open'] ?? 0);
+        if (
+          platformSearchCount >= ChatGLMBrowserProvider.PLATFORM_SEARCH_GIVEUP_COUNT &&
+          elapsed > ChatGLMBrowserProvider.PLATFORM_SEARCH_GIVEUP_SECONDS
+        ) {
+          logger.warn(
+            `[chatglm] 本轮平台自带搜索已触发 ${platformSearchCount} 次` +
+              `（已等待 ${elapsed.toFixed(0)}s），对本地任务无价值，提前收尾把预算留给兜底`,
+          );
+          break;
+        }
+
         // 活动式空闲超时：只要持续有新内容就不算空闲
         if ((nowTs - lastActivity) / 1000 > idleTimeout) {
           logger.info(`[chatglm] 空闲超时（${idleTimeout.toFixed(0)}s 无新内容），结束等待`);
@@ -1059,6 +1122,179 @@ export class ChatGLMBrowserProvider extends BaseProvider {
         }
       }
       if (isLongest) writeFileSync(longest, sseRaw, 'utf8');
+    } catch {
+      // 落盘失败不影响主流程
+    }
+  }
+
+  /**
+   * 侦察：导出**平台自己的请求体**。
+   *
+   * ## 要回答的问题（决定架构走向）
+   * 网页端 Agent 与原生模型最大的差别在于：它只有**自己固定的工具集**
+   * （`search` / `open` / `click` / `execute_sandbox_code` / `finish`，且由平台服务端执行），
+   * 而原生模型接受调用方传入的 `tools` 并回传 `tool_calls`。
+   * 如果平台的 ask 接口**接受 tools / 函数定义**，我们就能把客户端工具直接交给它、
+   * 用它的原生函数调用通道承载，彻底扔掉「注入 `<tool_call>` 文本协议 + 正则解析 + 四层兜底」；
+   * 反之文本桥就删不掉。
+   *
+   * 因此这里把请求体原样落盘（`logs/chatglm_platform_request.txt`），
+   * 并在日志里打**顶层字段名**（最关键的结论：有没有 tools/functions 之类的入口）。
+   */
+  private async dumpPlatformRequests(): Promise<void> {
+    if (!this.page) return;
+
+    let reqs: Array<{ method?: string; url?: string; contentType?: string; body?: string }> | null;
+    try {
+      reqs = (await this.page.evaluate(iife(REQUEST_BODIES_GET_JS))) as typeof reqs;
+    } catch (error) {
+      logger.debug(`[recon] 读取平台请求体失败: ${String(error)}`);
+      return;
+    }
+
+    if (!Array.isArray(reqs) || reqs.length === 0) {
+      logger.warn('[recon] 未捕获到平台请求体（hook 未生效？或该请求走 WebSocket / 原生 fetch 之外）');
+      return;
+    }
+
+    for (const r of reqs) {
+      const fields = topLevelJsonFields(r.body ?? '');
+      logger.info(
+        `[recon] 平台请求 ${r.method ?? ''} ${r.url ?? ''} | content-type=${r.contentType ?? ''} | ` +
+          `顶层字段=[${fields.join(', ')}] | 体积=${(r.body ?? '').length} | ` +
+          `开头=${JSON.stringify((r.body ?? '').slice(0, 160))}`,
+      );
+
+      // 阶段 3 的验证闭环：页面开关到底有没有改变平台参数
+      if ((r.url ?? '').includes('/assistant/stream')) {
+        const meta = askMetaDataOf(r.body ?? '');
+        logger.info(
+          `[聊天参数] 平台侧: is_networking=${String(meta['is_networking'])} ` +
+            `chat_mode=${String(meta['chat_mode'])} reasoning_effort=${String(meta['reasoning_effort'])} ` +
+            `selected_model=${String(meta['selected_model'])}`,
+        );
+      }
+    }
+
+    try {
+      mkdirSync(SSE_LOG_DIR, { recursive: true });
+      const text = reqs
+        .map(
+          (r, i) =>
+            `### [${i}] ${r.method ?? ''} ${r.url ?? ''}\n` +
+            `content-type: ${r.contentType ?? ''}\n\n${r.body ?? ''}\n`,
+        )
+        .join('\n');
+      writeFileSync(join(SSE_LOG_DIR, 'chatglm_platform_request.txt'), text, 'utf8');
+    } catch {
+      // 落盘失败不影响主流程
+    }
+  }
+
+  /**
+   * 发送前应用页面偏好：**关掉「联网搜索」**、**思考强度降为「快速」**。
+   *
+   * ⚠️ 这两项直接决定「模型会不会去刷平台自带的搜索」与「每轮要想多久」
+   * （实测默认开着时单轮 90~200s、`search` 刷 57 次）。失败只记日志，绝不阻断本轮。
+   *
+   * 逃生的口子：设 `WEBAIAPI_SKIP_PAGE_PREFS=1` 可跳过（排查用）。
+   */
+  private async applyChatPreferences(): Promise<void> {
+    if (!this.page) return;
+    if (process.env['WEBAIAPI_SKIP_PAGE_PREFS'] === '1') return;
+
+    const started = Date.now();
+    try {
+      const r = (await this.page.evaluate(iife(APPLY_CHAT_PREFS_JS))) as {
+        clicked?: string[];
+        before?: { searchBtn?: { cls?: string } | null; items?: Array<{ text?: string; cls?: string; visible?: boolean; popper?: string }> };
+        after?: { searchBtn?: { cls?: string } | null; items?: Array<{ text?: string; cls?: string; visible?: boolean; popper?: string }> };
+        notes?: string[];
+      } | null;
+      if (!r) return;
+
+      /** 取快照里「带 selected 的思考强度项」。 */
+      const selOf = (snap: typeof r.before): string =>
+        (snap?.items ?? [])
+          .filter((it) => /selected/.test(String(it.cls)))
+          .map((it) => `${String(it.text).slice(0, 12)}`)
+          .join('|') || '（无 selected）';
+
+      logger.info(
+        `[聊天参数] 点击=${JSON.stringify(r.clicked ?? [])}, ` +
+          `思考强度选中: ${selOf(r.before)} → ${selOf(r.after)}, ` +
+          `联网按钮 class: ${String(r.before?.searchBtn?.cls ?? '(无)').slice(0, 60)} → ` +
+          `${String(r.after?.searchBtn?.cls ?? '(无)').slice(0, 60)}, 耗时=${Date.now() - started}ms`,
+      );
+
+      try {
+        mkdirSync(SSE_LOG_DIR, { recursive: true });
+        writeFileSync(
+          join(SSE_LOG_DIR, 'chatglm_page_prefs.txt'),
+          JSON.stringify(r, null, 2),
+          'utf8',
+        );
+      } catch {
+        // 落盘失败不影响主流程
+      }
+
+      // 弹层别留着挡发送（发送路径虽有自己的浮层处理，这里先收干净）
+      try {
+        await this.page.keyboard.press('Escape');
+      } catch {
+        // 忽略
+      }
+    } catch (error) {
+      logger.debug(`[chatglm] 应用页面偏好失败: ${String(error)}`);
+    }
+  }
+
+  /**
+   * 侦察：导出「联网搜索 / 深度思考」相关的页面开关与本地存储键。
+   *
+   * ## 要回答的问题（省时间的最大杠杆）
+   * 平台 ask 请求体里有 `meta_data.is_networking`（默认 true）与
+   * `chat_mode=deep_thinking` + `reasoning_effort=max`：
+   * 前者让模型不停去调平台自带的联网搜索（`search` 单轮 57 次、45 个 query），
+   * 后者让每回合要「想」90~200s。它们都是**页面 UI 状态**，
+   * 只有点到对应开关才能在发请求前改掉。
+   *
+   * 探测结果落盘 `logs/chatglm_page_toggles.txt`（每进程一次）。
+   */
+  private async probeChatToggles(): Promise<void> {
+    if (!this.page) return;
+
+    let data: unknown;
+    try {
+      data = await this.page.evaluate(iife(PROBE_CHAT_TOGGLES_JS));
+    } catch (error) {
+      logger.debug(`[recon] 探测页面开关失败: ${String(error)}`);
+      return;
+    }
+    if (!data || typeof data !== 'object') return;
+
+    const rec = data as {
+      controls?: Array<{ text?: string; aria?: string; cls?: string }>;
+      matched?: Array<{ text?: string; aria?: string; cls?: string }>;
+      storage?: Record<string, string>;
+    };
+
+    logger.info(
+      `[recon] 页面开关探测：控件 ${rec.controls?.length ?? 0} 个，命中「联网/搜索/深度思考」` +
+        `${rec.matched?.length ?? 0} 个：` +
+        JSON.stringify((rec.matched ?? []).slice(0, 8).map((m) => `${m.text || m.aria}(${m.cls})`)),
+    );
+    logger.info(
+      `[recon] 本地存储键：${JSON.stringify(Object.keys(rec.storage ?? {}).slice(0, 20))}`,
+    );
+
+    try {
+      mkdirSync(SSE_LOG_DIR, { recursive: true });
+      writeFileSync(
+        join(SSE_LOG_DIR, 'chatglm_page_toggles.txt'),
+        JSON.stringify(data, null, 2),
+        'utf8',
+      );
     } catch {
       // 落盘失败不影响主流程
     }

@@ -41,6 +41,24 @@ export function computeIncremental(
 }
 
 /**
+ * 取 JSON 文本的**顶层字段名**（解析失败返回空数组）。
+ *
+ * 用途：侦察「网页平台自己的请求体长什么样」——判断能否把客户端工具定义交给平台、
+ * 用它的原生函数调用通道承载（见 `logs/chatglm_platform_request.txt`）。
+ * 请求体可能被截断/非 JSON，所以**绝不能抛异常**。
+ */
+export function topLevelJsonFields(body: string | null | undefined): string[] {
+  if (!body) return [];
+  try {
+    const parsed: unknown = JSON.parse(body);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
+    return Object.keys(parsed as Record<string, unknown>);
+  } catch {
+    return [];
+  }
+}
+
+/**
  * 截断过长文本并附加说明（Python 的 `truncate_message`，原本只在已删除的平台
  * Provider 里用；这里保留一个显式版本供调试脚本使用）。
  */

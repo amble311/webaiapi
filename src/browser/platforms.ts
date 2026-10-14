@@ -43,7 +43,7 @@ export interface PlatformSpec {
   id: string;
   /** 中文显示名（菜单 / 日志 / `/status` 用）。 */
   displayName: string;
-  /** 登录入口（`wbai login` 会打开它）。 */
+  /** 登录入口（`webapi login` 会打开它）。 */
   loginUrl: string;
   /**
    * Web UI 内部 API 的匹配特征（用于从被抓请求里认出哪个含认证信息）。
@@ -54,7 +54,7 @@ export interface PlatformSpec {
    * 是否已实现对话 Provider。
    *
    * `false` 表示**只能捕获凭证、暂不能对话** —— 这是给未来平台留的位置：
-   * 先把登录/身份提取接通（这样 `wbai login` 菜单里就能看到它），
+   * 先把登录/身份提取接通（这样 `webapi login` 菜单里就能看到它），
    * 等 Provider 写好再把本字段翻成 `true` 即可。
    */
   providerImplemented: boolean;

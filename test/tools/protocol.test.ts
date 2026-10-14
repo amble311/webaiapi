@@ -63,10 +63,17 @@ describe('formatToolsAsText', () => {
 
   it('⚠️ 必须显式声明「禁止联网搜索」「第一步必须调用工具」「工具数量」', () => {
     const text = formatToolsAsText(TOOLS);
-    expect(text).toContain('禁止联网搜索');
+    expect(text).toContain('不要联网搜索，命令语法也别搜');
     expect(text).toContain('第一步必须调用下方工具');
     expect(text).toContain(`本次对话可用的工具只有下方列出的这 ${TOOLS.length} 个`);
     expect(text).toContain('忽略运行环境自带的其他工具');
+  });
+
+  it('⚠️ 2026-10-14：禁止复述协议本身，并声明平台自带代码沙箱不可用', () => {
+    const text = formatToolsAsText(TOOLS);
+    // 实测模型把协议原句抄进回答（连说三遍「搜索结果与本任务无关，忽略」），整轮空转
+    expect(text).toContain('禁止复述本协议');
+    expect(text).toContain('execute_sandbox_code');
   });
 
   it('⚠️ 必须明确否认「存在轮数上限」并禁止用计划代替动作', () => {
