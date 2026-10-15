@@ -1067,10 +1067,18 @@ export class ChatGLMBrowserProvider extends BaseProvider {
        * 200 的空响应（表现为「AI 没反应」）。实测：模型整轮调用**网页端自带的联网搜索**
        * （SSE 里出现 search 387 次、报文 410KB），从头到尾没有 type=text。
        *
-       * ⚠️ 但只要本轮还有**思考材料**就不要报错：routes 的策略3 会拿「SSE 回答 +
-       *    SSE 思考 + DOM」再走一轮转换，能从中恢复出工具调用；此时若回传 error，
-       *    routes 会直接跨平台切换，思考里的工具意图就被白白丢掉了。
-       *    只有**连思考都没有**才判定本轮失败。 */
+       * ⚠️ 但只要本轮还有**思考材料**就不要报错：上层（`routes/chat.ts`）会用
+       *    「SSE 回答 + SSE 思考 + DOM」这份材料去驱动**动作恢复轮**，能从中恢复出工具调用；
+       *    此时若回传 error，routes 会直接跨平台切换，思考里的工具意图就被白白丢掉了。
+       *    只有**连思考都没有**才判定本轮失败。
+       *
+       * ⚠️⚠️ 2026-10-16 补记（这里曾经"注释在骗人"）：原注释写的是「routes 的策略3 会
+       *    再走一轮转换」——而 2026-10-14 的兜底重构**把策略3（两轮 reparse）删掉了**，
+       *    当时动作恢复轮的三个触发条件（像计划书 / 调了不存在的工具 / 自述没工具）
+       *    在这条路径上**一个都不命中**（没有正文、没有调用、也没有那类话术）→
+       *    思考材料照样白丢、客户端拿到一句空响应说明。
+       *    现在动作恢复轮补了第 4 个触发条件「**完全没有正文但有材料**」，
+       *    这条「不发 error」的取舍才真正兑现。 */
       if (!lastText) {
         const toolsDesc =
           Object.entries(platformToolStats)
@@ -1094,8 +1102,8 @@ export class ChatGLMBrowserProvider extends BaseProvider {
 
         if (thinkMaterial) {
           logger.warn(
-            '[chatglm] 本轮无正文但有思考材料，交给上层从思考里恢复工具调用' +
-              '（策略3 已放宽门槛）；不发 error，避免误触发切换',
+            '[chatglm] 本轮无正文但有思考材料，交给上层用材料驱动「动作恢复轮」恢复工具调用；' +
+              '不发 error，避免误触发跨平台切换',
           );
         } else {
           yield {

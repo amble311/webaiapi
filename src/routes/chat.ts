@@ -77,6 +77,7 @@ import { errorMessage } from '../utils/errors.js';
 import { buildReparseInput, streamWithFailover } from './failover.js';
 import {
   BROWSER_PROMPT_MAX_LEN,
+  EMPTY_RESPONSE_NOTICE,
   CONTINUE_MAX_BUDGET,
   CONTINUE_MIN_BUDGET,
   TOTAL_TIME_BUDGET,
@@ -819,7 +820,10 @@ export async function parseAndRecoverToolCalls(params: {
 
   logAiPlatformResponseComplete({
     requestId,
-    platform: currentPlatform ?? 'unknown',
+    /* ⚠️ 零产出时 `streamWithFailover` 一个 chunk 都没 yield 过 → `currentPlatform` 仍是 null，
+     * 日志里就会出现「AI 平台: unknown」（2026-10-16 排查时看到的正是这一行）。
+     * 拿不到平台名时退化为**请求的模型名**，比 'unknown' 有信息量。 */
+    platform: currentPlatform ?? rawRequest.model,
     roundNum: 1,
     rawText: fullResponse,
   });
@@ -981,10 +985,22 @@ export async function parseAndRecoverToolCalls(params: {
   const recoveryMaterial = stripPlatformToolNoise(buildReparseInput(source, fullResponse));
   const isUnfinished = looksUnfinishedAnswer(parsedText);
   const unavailableClaim = findToolUnavailableClaim(parsedText);
+  /* ★ 2026-10-16：**完全没有正文**（`parsedText` 为空）但有材料（思考/SSE 材料）时也要救。
+   * 实测事故：平台整轮只产出**思考**、没有一个字的正文（provider 侧因为「有思考材料」按设计
+   * 不报错），于是文本=0、工具调用=0、三个触发条件一个都不命中 → 空响应分支 → 客户端拿到
+   * 一句「本轮未产出正文」。材料明明在手（思考里就有它想做的事），白白丢掉。
+   *
+   * ⚠️ 与 2026-10-14 那个死循环**天然互斥**：正常收尾一定有**正文**（`parsedText` 非空），
+   *    所以这一条永远不会把「无需进一步操作」的收尾逼成死循环。 */
+  const hasNoAnswerText = parsedText.trim().length === 0;
+  const hasMaterial = recoveryMaterial.trim().length >= 10;
   const needsRecovery =
     parsedToolCalls.length === 0 &&
     tools.length > 0 &&
-    (droppedUnknownNames.length > 0 || isUnfinished || Boolean(unavailableClaim));
+    (droppedUnknownNames.length > 0 ||
+      isUnfinished ||
+      Boolean(unavailableClaim) ||
+      (hasNoAnswerText && hasMaterial));
 
   if (needsRecovery) {
     const remaining = deadlineTs - Date.now();
@@ -1323,22 +1339,39 @@ export async function* streamChatCompletion(
 
       /* ===== 空响应检测 =====
        * 文本=0 且工具调用=0 时**不能静默结束**（旧实现只发一个空 delta）：
-       * 客户端收到空回复会表现为「AI 没反应」，用户无法区分「卡住」与「失败」。 */
+       * 客户端收到空回复会表现为「AI 没反应」，用户无法区分「卡住」与「失败」。
+       * ⚠️ 文案必须**如实**（见 `EMPTY_RESPONSE_NOTICE` 的说明）：真因通常是
+       *    平台整轮只产出思考、没有正文，与「请求太大」无关。 */
       if (!parsedText && parsedToolCalls.length === 0 && !fullResponse) {
         logger.warn(
-          '[tool_calls] 检测到空响应（首轮无正文、兜底轮也没恢复出内容），向客户端说明原因后结束',
+          '[tool_calls] 空响应（首轮无正文、兜底轮也没恢复出内容）：如实告知客户端后结束',
         );
         yield contentChunk({
           id: requestId,
           model,
           role: 'assistant',
           // ⚠️ 与原生对齐：不写「[平台] …」这类内部前缀（平台名在日志里）。
-          content:
-            '本轮未产出任何可用内容（模型没有生成正文，也没有给出工具调用）。' +
-            '请重试；若反复出现，把请求拆小一点。',
+          content: EMPTY_RESPONSE_NOTICE,
         });
         yield contentChunk({ id: requestId, model, content: '', finishReason: 'stop' });
         yield DONE;
+
+        /* ⚠️ 早退也必须留痕（2026-10-16 排查时踩到）：
+         * 原来这里直接 `return`，跳过了后面的「响应完成」日志与 `logClientResponse` ——
+         * 日志里只留一条 `[<<< AI] 原始文本长度: 0`，**查不到这一轮的结局**，
+         * 排查时只能靠猜（当时把 73s 的空轮次误读成"客户端 9ms 就没了"）。 */
+        logger.info(`[${requestId}] ========== 响应完成（空响应）==========`);
+        logger.info(
+          `[${requestId}] 平台: ${currentPlatform ?? model}, 完成原因: stop, ` +
+            '响应长度: 0, 工具调用数: 0, 已向客户端说明原因',
+        );
+        logClientResponse({
+          requestId,
+          model: currentPlatform ?? model,
+          finishReason: 'stop',
+          content: EMPTY_RESPONSE_NOTICE,
+          duration: (Date.now() - startTime) / 1000,
+        });
         return;
       }
 

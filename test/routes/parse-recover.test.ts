@@ -36,7 +36,7 @@ vi.mock('../../src/log/api-logger.js', async (importOriginal) => {
 import type { HistoryDB } from '../../src/controllers/history-db.js';
 import type { ModelRouter } from '../../src/controllers/router.js';
 import type { ChatRequest } from '../../src/providers/base.js';
-import { resetLastRawSse } from '../../src/providers/chatglm-sse.js';
+import { resetLastRawSse, setLastRawSse } from '../../src/providers/chatglm-sse.js';
 import { parseAndRecoverToolCalls, type PreparedRequest } from '../../src/routes/chat.js';
 import { createToolMaps } from '../../src/tools/names.js';
 import type { ToolDefinition } from '../../src/types/message.js';
@@ -301,6 +301,68 @@ describe('parseAndRecoverToolCalls：模型调了客户端没有的工具', () =
     expect(outcome.parsedToolCalls).toEqual([]);
     expect(outcome.finishReason).toBe('stop');
     expect(outcome.parsedText).toBe(conclusion);
+  });
+
+  it('⭐ 平台整轮只产出思考、没有正文 → 用思考材料驱动恢复轮（2026-10-16 事故）', async () => {
+    const seen: string[] = [];
+    const router = makeRouter(
+      ['<tool_call>\n{"name": "bash", "arguments": {"command": "ls /home/amble/object/btc"}}\n</tool_call>'],
+      seen,
+    );
+
+    /* 主轮 SSE：`text` 为空、`think` 里有它想做的事 —— provider 侧因为「有思考材料」
+     * 按设计**不报错**，于是文本=0、工具调用=0，客户端只会看到一句空响应说明。
+     * 材料明明在手（思考里就有它要做的事），必须用它驱动恢复轮。 */
+    setLastRawSse({ text: '', think: '我需要：1. 用 list_dir 查看项目结构；2. 清理无用脚本。' });
+
+    try {
+      const outcome = await parseAndRecoverToolCalls({
+        parseSource: '',
+        fullResponse: '',
+        fromSse: true,
+        currentPlatform: 'chatglm',
+        prepared: prepared(),
+        modelRouter: router,
+        historyDb: {} as unknown as HistoryDB,
+        toolMaps: createToolMaps(TOOLS),
+        options: { fixPaths: false, validateSearchReplace: false },
+      });
+
+      expect(seen).toHaveLength(1);
+      // 没有「调错名字」时走「压根没动手」那套措辞
+      expect(seen[0]).toContain('没有给出可执行的工具调用');
+      // 思考材料要带进恢复轮（否则它不知道要做什么）
+      expect(seen[0]).toContain('用 list_dir 查看项目结构');
+      expect(outcome.parsedToolCalls.map((tc) => tc.function.name)).toEqual(['bash']);
+      expect(outcome.finishReason).toBe('tool_calls');
+    } finally {
+      resetLastRawSse();
+    }
+  });
+
+  it('⚠️ 有正文的正常收尾 + 空思考 → 仍然不触发（H2 不会复活死循环）', async () => {
+    const seen: string[] = [];
+    const router = makeRouter(['不该被调用'], seen);
+    setLastRawSse({ text: '', think: '' });
+
+    try {
+      const outcome = await parseAndRecoverToolCalls({
+        parseSource: '清理完成：删除了 3 个无用脚本，测试全绿。',
+        fullResponse: '清理完成：删除了 3 个无用脚本，测试全绿。',
+        fromSse: true,
+        currentPlatform: 'chatglm',
+        prepared: prepared(),
+        modelRouter: router,
+        historyDb: {} as unknown as HistoryDB,
+        toolMaps: createToolMaps(TOOLS),
+        options: { fixPaths: false, validateSearchReplace: false },
+      });
+
+      expect(seen).toEqual([]);
+      expect(outcome.finishReason).toBe('stop');
+    } finally {
+      resetLastRawSse();
+    }
   });
 
   it('⭐ 重复调用抑制：同一工具+参数已执行 ≥2 次 → 不再下发（止住循环）', async () => {

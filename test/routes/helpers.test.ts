@@ -9,7 +9,12 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { formatRecentProgress, stripPlatformToolNoise } from '../../src/routes/helpers.js';
+import {
+  EMPTY_RESPONSE_NOTICE,
+  formatRecentProgress,
+  looksUnfinishedAnswer,
+  stripPlatformToolNoise,
+} from '../../src/routes/helpers.js';
 import type { ChatMessage } from '../../src/types/message.js';
 
 describe('stripPlatformToolNoise', () => {
@@ -114,5 +119,61 @@ describe('formatRecentProgress', () => {
 
   it('空消息列表不崩', () => {
     expect(formatRecentProgress([])).toBe('');
+  });
+});
+
+/**
+ * 「只说计划、没有动手」的判定（`looksUnfinishedAnswer`）。
+ *
+ * ⚠️ 2026-10-16 实测（玄猪截图）：回答「**我先查看**项目目录结构，识别出可能的历史脚本和
+ * 无用文件。」之后**一个工具调用都没有**就结束了 —— 这句不含旧的标记词，于是恢复轮不触发、
+ * 客户端拿到纯文本就结束回合。补了「宣布动作」句式后它必须命中。
+ */
+describe('looksUnfinishedAnswer', () => {
+  it('⭐ 真实案例：「宣布了动作」也算未完成', () => {
+    expect(
+      looksUnfinishedAnswer('我先查看项目目录结构，识别出可能的历史脚本和无用文件。'),
+    ).toBe(true);
+    expect(looksUnfinishedAnswer('接下来我会把这三个文件改掉。')).toBe(true); // 旧标记词
+    expect(looksUnfinishedAnswer('先检查一下依赖版本。')).toBe(true);
+    expect(looksUnfinishedAnswer('我打算运行测试确认。')).toBe(true);
+    expect(looksUnfinishedAnswer('我来梳理一下调用链。')).toBe(true);
+  });
+
+  it('⚠️ 回顾式陈述 / 已完成的总结**不能**误判（否则每轮多烧 80~100s）', () => {
+    expect(looksUnfinishedAnswer('我查看了文件，结论是配置项写错了。')).toBe(false);
+    expect(looksUnfinishedAnswer('我删除了 3 个无用脚本，并已运行测试验证。')).toBe(false);
+    expect(looksUnfinishedAnswer('无需进一步操作，任务已完成。')).toBe(false);
+    expect(looksUnfinishedAnswer('API 后端运行正常，TUI 未启动，没有新增信息需要处理。')).toBe(
+      false,
+    );
+    expect(looksUnfinishedAnswer('下面是本次清理的结果汇总。')).toBe(false);
+  });
+
+  it('旧标记词仍然有效（不回归）', () => {
+    expect(looksUnfinishedAnswer('仍有三处关键文件内容未知，需先补读。')).toBe(true);
+    expect(looksUnfinishedAnswer('工具轮数已达上限（8/8），尚未修改任何文件。')).toBe(true);
+    expect(looksUnfinishedAnswer('')).toBe(false);
+  });
+
+  it('⚠️ 正则不能带 g 标志（否则同一输入第二次判 false）', () => {
+    const text = '我先查看项目目录结构。';
+    expect(looksUnfinishedAnswer(text)).toBe(true);
+    expect(looksUnfinishedAnswer(text)).toBe(true);
+    expect(looksUnfinishedAnswer(text)).toBe(true);
+  });
+});
+
+/**
+ * 「空响应」文案（2026-10-16）：必须**如实**（平台只出思考），不能把用户引向
+ * 「请求太大」这种错误方向。
+ */
+describe('EMPTY_RESPONSE_NOTICE', () => {
+  it('如实说明「只输出了思考」，且不再提「把请求拆小」', () => {
+    expect(EMPTY_RESPONSE_NOTICE).toContain('只输出了思考');
+    expect(EMPTY_RESPONSE_NOTICE).not.toContain('把请求拆小');
+    expect(EMPTY_RESPONSE_NOTICE).not.toContain('模型没有生成正文');
+    // 没有内部前缀（与原生模型的 content 对齐）
+    expect(EMPTY_RESPONSE_NOTICE.startsWith('[')).toBe(false);
   });
 });
