@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  countPlatformToolCalls,
   extractSseAll,
   extractSseAnswer,
   getLastRawSse,
@@ -8,6 +9,7 @@ import {
   isBrowserConnectionError,
   iterSseJson,
   resetLastRawSse,
+  pickTextSemantics,
   safeIncremental,
   setLastRawSse,
 } from '../../src/providers/chatglm-sse.js';
@@ -325,3 +327,119 @@ describe('主轮全局（_last_raw_sse_*）', () => {
   });
 });
 
+
+/**
+ * 正文的两种流语义（2026-10-15 事故回归）。
+ *
+ * 事故：同一 `logic_id` 下发 124 个 1~32 字符的片段，旧的「只取最长的那一个片段」
+ * 把 2032 字的完整回答丢成 37 字的表格残句 → 没有工具调用 → 客户端收到残句 + stop
+ * → 用户看到「对话无故停止」。
+ */
+describe('正文语义：增量 / 快照（pickTextSemantics + extractSseAll）', () => {
+  it('⭐ 增量流：碎片拼起来才是完整回答（按今天的真实片段形状）', () => {
+    const fragments = [
+      '根据', '协议', '要求', '，', '我', '第一步', '必须', '调用', '读取', '工具', '，',
+      '但当前环境**没有提供本地文件系统访问权限**（无 `list',
+      '_dir` / `read_file` 等真实工具可用），',
+      '无法直接操作 `/home/amble/object/btc',
+      '` 目录。',
+    ];
+    const raw = fragments.map((t) => contentEvt('lid-inc', [{ type: 'text', text: t }])).join('');
+
+    const r = extractSseAll(raw);
+    expect(r.answer).toBe(fragments.join(''));
+    expect(r.answer).toContain('没有提供本地文件系统访问权限');
+  });
+
+  it('⭐ 快照流：草稿 + 整段改写 → 只取最终那份（绝不能拼成「草稿+最终」）', () => {
+    const draft = `草稿：${'甲'.repeat(300)}`;
+    const final = `最终答案：${'乙'.repeat(500)}`;
+    const raw =
+      contentEvt('lid-snap', [{ type: 'text', text: draft }]) +
+      contentEvt('lid-snap', [{ type: 'text', text: final }]);
+
+    const r = extractSseAll(raw);
+    expect(r.answer).toBe(final);
+    expect(r.answer).not.toContain('草稿');
+  });
+
+  it('快照流：新版本以旧版本为前缀（整段扩展）→ 取新版，不重复拼接', () => {
+    const draft = 'A'.repeat(200);
+    const final = `${draft}${'B'.repeat(200)}`;
+    const raw =
+      contentEvt('lid-ext', [{ type: 'text', text: draft }]) +
+      contentEvt('lid-ext', [{ type: 'text', text: final }]);
+
+    const r = extractSseAll(raw);
+    expect(r.answer).toBe(final);
+    expect(r.answer.length).toBe(400);
+  });
+
+  it('平台把同一份快照重复下发 → 不能重复拼接', () => {
+    const once = 'X'.repeat(300);
+    const raw =
+      contentEvt('lid-dup', [{ type: 'text', text: once }]) +
+      contentEvt('lid-dup', [{ type: 'text', text: once }]);
+
+    expect(extractSseAll(raw).answer).toBe(once);
+  });
+
+  it('单个片段（最常见的形态）→ 原样返回', () => {
+    const raw = contentEvt('lid-one', [{ type: 'text', text: '只回四个字：收到收到' }]);
+    expect(extractSseAll(raw).answer).toBe('只回四个字：收到收到');
+  });
+
+  it('多个 logic_id（不同草稿）→ 取最长的那一份，不跨组拼接', () => {
+    const short = '短草稿';
+    const long = `长草稿${'丙'.repeat(120)}`;
+    const raw =
+      contentEvt('lid-a', [{ type: 'text', text: short }]) +
+      contentEvt('lid-b', [{ type: 'text', text: long }]);
+
+    expect(extractSseAll(raw).answer).toBe(long);
+  });
+
+  it('pickTextSemantics 判定表', () => {
+    const g = (joined: string, longest: string, count: number, sawSnapshot = false) => ({
+      joined,
+      longest,
+      count,
+      sawSnapshot,
+    });
+    // 单片段
+    expect(pickTextSemantics(g('abc', 'abc', 1))).toBe('abc');
+    // 大量小碎片 → 增量
+    expect(pickTextSemantics(g('x'.repeat(2000), 'x'.repeat(31), 124))).toBe('x'.repeat(2000));
+    // 快照信号 → 取最长
+    expect(pickTextSemantics(g('x'.repeat(600), 'x'.repeat(400), 2, true))).toBe('x'.repeat(400));
+    // 少量大片段（草稿+最终）→ 取最长
+    expect(pickTextSemantics(g('x'.repeat(800), 'x'.repeat(500), 2))).toBe('x'.repeat(500));
+  });
+});
+
+/**
+ * 平台自带工具的计数（提前收尾判据用的信号）。
+ *
+ * ⚠️ 实测出现过的名字：`search` / `open` / `execute_sandbox_code` / **`retrieve`**
+ * （2026-10-15：单轮 6~9 次 retrieve，跑去查 v2rayN 代理配置，白烧 145s）。
+ */
+describe('countPlatformToolCalls', () => {
+  it('排除 finish（每轮正常收尾都会推）', () => {
+    expect(countPlatformToolCalls({ finish: 193 })).toBe(0);
+    expect(countPlatformToolCalls({ search: 57, finish: 64 })).toBe(57);
+  });
+
+  it('⭐ retrieve / 沙箱 / 浏览器类工具同样计入', () => {
+    expect(countPlatformToolCalls({ retrieve: 6, finish: 3 })).toBe(6);
+    expect(countPlatformToolCalls({ execute_sandbox_code: 57, finish: 64 })).toBe(57);
+    expect(countPlatformToolCalls({ open: 52 })).toBe(52);
+    expect(countPlatformToolCalls({ search: 3, open: 2, retrieve: 1, finish: 9 })).toBe(6);
+  });
+
+  it('空表 / 脏值不崩', () => {
+    expect(countPlatformToolCalls({})).toBe(0);
+    expect(
+      countPlatformToolCalls({ a: 0, b: -1, c: Number.NaN, d: 2 } as Record<string, number>),
+    ).toBe(2);
+  });
+});

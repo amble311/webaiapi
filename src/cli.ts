@@ -97,7 +97,7 @@ export function helpText(): string {
   }).join('\n');
 
   return `
-webapi —— 把国产 AI 聊天网页包装成 OpenAI 兼容接口
+webapi —— 把 AI 聊天网页包装成 OpenAI 兼容接口
 
 用法:
   webapi login [<platform>] [--account <id>]   登录并捕获凭证（可多账号，交互式选择）

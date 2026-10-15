@@ -83,6 +83,7 @@ import {
   TOOL_ROUND_LIMIT,
   detectMismatchedAnswer,
   extractUserQuestion,
+  findToolUnavailableClaim,
   formatRecentProgress,
   getSessionDelta,
   isReadOnlyTool,
@@ -964,9 +965,12 @@ export async function parseAndRecoverToolCalls(params: {
   /* ==================================================================== */
   /* 步骤 5：动作恢复轮（**唯一一层兜底**）                               */
   /*                                                                      */
-  /* ⚠️ 触发条件**只剩两个**（2026-10-14 实测踩坑后收紧）：                */
+  /* ⚠️ 触发条件只有三个（都是「明确没救」的信号）：                        */
   /*   ① 调了客户端没有的工具（明确无效，必须救）；                        */
-  /*   ② 回答像计划书 / 只说不做（`looksUnfinishedAnswer`）。              */
+  /*   ② 回答像计划书 / 只说不做（`looksUnfinishedAnswer`）；              */
+  /*   ③ **回答自述「没有工具 / 读不到本地文件」**                         */
+  /*      （`looksLikeToolUnavailableClaim`，2026-10-15 实测事故：模型说      */
+  /*      「当前环境没有提供本地文件系统访问权限」，其实 21 个工具都在）。    */
   /*                                                                      */
   /* 原来还有一条「本轮一个工具调用都没有 → 强制再驱动一轮」，它会把**正常   */
   /* 收尾**的回答（「无需进一步操作」「已确认无变化」）也判成「没推进任务」   */
@@ -976,10 +980,11 @@ export async function parseAndRecoverToolCalls(params: {
   /* ==================================================================== */
   const recoveryMaterial = stripPlatformToolNoise(buildReparseInput(source, fullResponse));
   const isUnfinished = looksUnfinishedAnswer(parsedText);
+  const unavailableClaim = findToolUnavailableClaim(parsedText);
   const needsRecovery =
     parsedToolCalls.length === 0 &&
     tools.length > 0 &&
-    (droppedUnknownNames.length > 0 || isUnfinished);
+    (droppedUnknownNames.length > 0 || isUnfinished || Boolean(unavailableClaim));
 
   if (needsRecovery) {
     const remaining = deadlineTs - Date.now();
@@ -994,6 +999,7 @@ export async function parseAndRecoverToolCalls(params: {
       logger.warn(
         '[tool_calls] 触发动作恢复轮（唯一一层兜底）：' +
           (uniqueNames.length ? `模型调了客户端没有的工具 ${uniqueNames.join(', ')}；` : '') +
+          (unavailableClaim ? `模型自述「${unavailableClaim}」；` : '') +
           `材料 ${recoveryMaterial.length} 字符；` +
           (isUnfinished ? '回答疑似「只说不做」' : '本轮无工具调用'),
       );

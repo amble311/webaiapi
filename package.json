@@ -1,7 +1,7 @@
 {
   "name": "webaiapi",
-  "version": "0.1.1",
-  "description": "把国产 AI 聊天网页（ChatGLM）包装成 OpenAI 兼容 API —— Playwright Firefox 纯浏览器自动化。命令名：webapi",
+  "version": "0.1.2",
+  "description": "Wrap AI chat web UIs (ChatGLM) into an OpenAI-compatible API — Playwright Firefox automation, no API key needed. 把 AI 聊天网页包装成 OpenAI 兼容 API（命令名：webapi）",
   "keywords": [
     "openai",
     "api-gateway",
@@ -32,7 +32,8 @@
     "dist",
     "bin",
     "README.md",
-    "postinstall.mjs"
+    "postinstall.mjs",
+    "README.en.md"
   ],
   "scripts": {
     "dev": "tsx src/cli.ts",

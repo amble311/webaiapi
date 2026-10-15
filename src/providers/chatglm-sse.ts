@@ -105,6 +105,66 @@ export interface SseExtractResult {
   platformTools: Record<string, number>;
 }
 
+/* ------------------------------------------------------------------ */
+/* 正文语义判定（增量 vs 快照）                                        */
+/* ------------------------------------------------------------------ */
+
+/** 同一 `logic_id` 下正文片段的统计（两种语义分别记账）。 */
+export interface TextGroupSemantics {
+  /** 按**增量**语义拼接出来的结果。 */
+  joined: string;
+  /** 单个片段里最长的那个（按**整段快照**语义的候选）。 */
+  longest: string;
+  /** 片段个数。 */
+  count: number;
+  /** 是否出现过「以当时累积内容为前缀」的片段（整段改写/扩展的信号）。 */
+  sawSnapshot: boolean;
+}
+
+/**
+ * 决定一份正文用哪种语义的结果。
+ *
+ * 平台**两种流语义都会出现**（都实测过）：
+ * - **增量**：很多小碎片，拼起来才是完整回答
+ *   （2026-10-15：124 个 1~32 字符的片段 → 2032 字符的完整回答）；
+ * - **快照**：先给一版草稿、再整段换成最终答案
+ *   （2026-09-27：无脑拼接会得到「草稿 + 最终答案」的乱码）。
+ *
+ * 判据（保守：宁可按快照取一份，也不拼出乱码）：
+ * 1. 只有一个片段 → 就是它；
+ * 2. 最长片段的两倍仍小于拼接长度 → 碎片量级悬殊 → **增量**；
+ * 3. 出现过快照信号（某片段以当时累积内容为前缀）→ **快照**（取最长）；
+ * 4. 最长片段占拼接长度 60% 以上 → 典型的「草稿 + 最终」少量大片段 → **快照**；
+ * 5. 其余 → **增量**。
+ */
+export function pickTextSemantics(g: TextGroupSemantics): string {
+  if (g.count <= 1) return g.joined || g.longest;
+  if (g.longest.length * 2 < g.joined.length) return g.joined;
+  if (g.sawSnapshot) return g.longest;
+  if (g.longest.length > g.joined.length * 0.6) return g.longest;
+  return g.joined;
+}
+
+/**
+ * 统计「模型在调网页平台自带工具」的次数（**排除 `finish`**）。
+ *
+ * `finish` 是平台每轮正常收尾都会推的内部调用（一轮里几十次），必须排除，
+ * 否则等于「任何一轮都算刷屏」。
+ *
+ * ⚠️ **别只认 `search` / `open`**：实测出现过的平台工具名还有
+ * `execute_sandbox_code`（单轮 57 次）与 **`retrieve`**
+ * （2026-10-15：单轮 6~9 次，把模型带去查 v2rayN 代理配置、白烧 145s）。
+ * 除 `finish` 之外一律计入，平台将来新增工具也自动覆盖。
+ */
+export function countPlatformToolCalls(platformTools: Record<string, number>): number {
+  let total = 0;
+  for (const [name, count] of Object.entries(platformTools)) {
+    if (name === 'finish') continue;
+    if (typeof count === 'number' && Number.isFinite(count) && count > 0) total += count;
+  }
+  return total;
+}
+
 /**
  * 从 SSE 原始报文里一次性提取（正文, 思考, 是否完成, 平台内部工具计数）。
  *
@@ -136,19 +196,25 @@ export interface SseExtractResult {
  *    改版后已不可靠，完成判定应以本信号为主。
  * 3. 该文本未经 Markdown 渲染，引号/下划线/空格都不会丢，
  *    是「写文件 / 改代码」**唯一可用的内容来源**。
- * 4. ⚠️ `text` **仍按「取最长」处理，不做累积拼接**：触发联网搜索时模型会
- *    **整段改写**回答（先给草稿、再换成最终答案），累积拼接会得到
- *    「草稿 + 最终答案」的乱码（2026-09-27 22:17 事故）。
+ * 4. ⚠️⚠️ `text` 有**两种流语义**，必须两种都记账再判定（`pickTextSemantics`）：
+ *    - **整段快照**：触发联网搜索时模型会整段改写回答（先给草稿、再换成最终答案），
+ *      无脑累积会得到「草稿 + 最终答案」的乱码（2026-09-27 22:17 事故）；
+ *    - **细粒度增量**：2026-10-15 实测同一 `logic_id` 下发 **124 个 1~32 字符的片段**，
+ *      拼起来才是完整回答（2032 字符）。此时「只取最长的那一个片段」= 把整段回答丢掉
+ *      （实测只剩 37 字符的表格残句）→ 没有工具调用 → 客户端收到残句 + `stop`
+ *      → 用户看到「对话无故停止」。
  *    `think` 不做改写，累积是安全的。
  */
 export function extractSseAll(raw: string): SseExtractResult {
-  let answer = '';
   let finished = false;
 
   /** `logic_id` → 该轮已累积的思考文本。 */
   const thinkGroups = new Map<string, string>();
   /** 保持出现顺序（Python 用 list 记录 key 顺序）。 */
   const thinkOrder: string[] = [];
+  /** `logic_id` → 正文片段的统计（增量/快照两种语义，见 {@link pickTextSemantics}）。 */
+  const textGroups = new Map<string, TextGroupSemantics>();
+  const textOrder: string[] = [];
   const platformTools: Record<string, number> = {};
 
   for (const obj of iterSseJson(raw)) {
@@ -176,8 +242,28 @@ export function extractSseAll(raw: string): SseExtractResult {
 
         if (ctype === 'text') {
           const s = typeof c['text'] === 'string' ? c['text'] : '';
-          // ⚠️ 取最长，绝不累积（见上方事实 4）
-          if (s.length > answer.length) answer = s;
+          if (!s) continue;
+
+          /* ⚠️ 正文**同时**按两种语义记账，最后才决定用哪个（见 pickTextSemantics）：
+           * - `joined`：把片段当**增量**拼接（今天实测的形态：124 个 1~32 字符的碎片
+           *   拼出 2032 字符的完整回答）；
+           * - `longest`：把片段当**整段快照**（2026-09-27 实测的形态：先给草稿、
+           *   再整段换成最终答案，此时拼接会得到「草稿 + 最终答案」乱码）。
+           * 旧的「只取最长的那一个片段」在增量流上会把整段回答丢掉（2026-10-15 事故：
+           * 2032 字答案只剩 37 字，客户端拿到残句 + stop →「对话无故停止」）。 */
+          const g = textGroups.get(lid);
+          if (!g) {
+            textGroups.set(lid, { joined: s, longest: s, count: 1, sawSnapshot: false });
+            textOrder.push(lid);
+          } else {
+            g.count += 1;
+            if (s.length > g.longest.length) g.longest = s;
+            /* 快照信号：新片段**包含**当时已累积的内容（整段改写/扩展/重复下发）。
+             * ⚠️ 只能查这个方向：反向（累积包含新片段）在增量流里天天发生
+             *    （例如累积 `…127.0.0.1` 之后来一个增量片段 `0.`）。 */
+            if (g.joined && s.includes(g.joined)) g.sawSnapshot = true;
+            g.joined += s;
+          }
           continue;
         }
 
@@ -213,6 +299,16 @@ export function extractSseAll(raw: string): SseExtractResult {
   }
 
   const think = thinkOrder.map((lid) => thinkGroups.get(lid) ?? '').join('\n\n');
+
+  /* 跨 `logic_id` 组仍取**最长的一份**：不同组通常是「不同草稿」，
+   * 把它们拼起来正是要避免的乱码。 */
+  let answer = '';
+  for (const lid of textOrder) {
+    const g = textGroups.get(lid);
+    if (!g) continue;
+    const picked = pickTextSemantics(g);
+    if (picked.length > answer.length) answer = picked;
+  }
 
   return { answer, think, finished, platformTools };
 }

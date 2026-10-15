@@ -70,6 +70,7 @@ import {
 } from './chatglm-dom.js';
 import { EXTRACT_RESPONSE_JS, FORCED_EXTRACT_JS } from './chatglm-dom-extract.js';
 import {
+  countPlatformToolCalls,
   extractSseAll,
   getLastRawSse,
   isBrowserConnectionError,
@@ -224,16 +225,25 @@ export class ChatGLMBrowserProvider extends BaseProvider {
   private readonly MAX_INPUT_LEN = 64000;
 
   /**
-   * 「平台自带搜索刷屏」的提前收尾阈值：本轮平台 search `≥ 次数` 且已等待 `> 秒数`。
+   * 「平台自带工具刷屏」的提前收尾阈值：本轮平台原生工具调用 `≥ 次数`、
+   * **计数仍在增长**、且已等待 `> 秒数`。
    *
-   * ⚠️ 2026-10-14 实测：模型把「bash 怎么删带空格的目录」当成需要检索的知识问题，
-   * 单轮在 ChatGLM 自带的 search 上刷了 **57 次**（45 个不同 query），耗掉 210s，
-   * 最后只吐出一段复述提示词的纯文本（零客户端工具调用）。
-   * 平台搜索对本地代码任务**永远没有价值**，而它一旦开始刷，等得越久亏得越多 ——
-   * 更致命的是把总预算吃光，让后面的 reparse / 续跑兜底没预算可用。
+   * ⚠️ 实测过的三种刷屏（都让模型脱离本地任务、白烧一整轮）：
+   * - `search` 57 次（2026-10-14，查「bash 怎么删带空格的目录」，耗 210s）；
+   * - `execute_sandbox_code` 57 次、`open` 52 次（同一天的另一批轮次）；
+   * - **`retrieve` 6~9 次**（2026-10-15，跑去查 v2rayN 代理配置，耗 145s）。
+   *
+   * 因此判据是「**除 `finish` 之外的全部平台工具**」（见 `countPlatformToolCalls`）——
+   * 只认 search/open 时，后两类完全拦不住。`finish` 是每轮正常收尾都会推的内部调用。
+   *
+   * 两个细节：
+   * 1. **只在计数仍在增长时收尾**（真的还在刷）—— 页面沉默（平台在服务端跑它自己的工具、
+   *    不推流）交给 90s 空闲超时，避免误切「早先调过一次、之后正常产出」的轮次；
+   * 2. 阈值取 3 次 / 60s：平台工具对本地任务没有价值，等得越久亏得越多，
+   *    更致命的是吃光总预算让兜底没预算可用。
    */
-  private static readonly PLATFORM_SEARCH_GIVEUP_COUNT = 3;
-  private static readonly PLATFORM_SEARCH_GIVEUP_SECONDS = 90;
+  private static readonly PLATFORM_TOOL_GIVEUP_COUNT = 3;
+  private static readonly PLATFORM_TOOL_GIVEUP_SECONDS = 60;
 
   /** 页面开关探测是否已做过（每进程一次，见 {@link probeChatToggles}）。 */
   private togglesProbed = false;
@@ -746,6 +756,8 @@ export class ChatGLMBrowserProvider extends BaseProvider {
     let maxSseLen = 0; // SSE 路径下 text+think 提取长度（辅助活跃信号）
     let maxSseRawLen = 0; // SSE 原始报文长度（**主活跃信号**，严格单调递增）
     let platformToolStats: Record<string, number> = {};
+    /** 上一轮见到的「平台工具调用次数」，用于判断它是否**仍在增长**（真的还在刷）。 */
+    let lastPlatformToolCount = 0;
 
     const startTime = Date.now();
     let lastActivity = Date.now();
@@ -953,18 +965,23 @@ export class ChatGLMBrowserProvider extends BaseProvider {
           }
         }
 
-        /* ===== 平台自带搜索刷屏 → 提前收尾 =====
-         * 见 PLATFORM_SEARCH_GIVEUP_COUNT 的说明：留着它只会白烧预算，
-         * 而预算恰恰是后面 reparse / 续跑兜底唯一的本钱。 */
-        const platformSearchCount =
-          (platformToolStats['search'] ?? 0) + (platformToolStats['open'] ?? 0);
+        /* ===== 平台自带工具刷屏 → 提前收尾 =====
+         * 见 PLATFORM_TOOL_GIVEUP_COUNT 的说明：留着它只会白烧预算，
+         * 而预算恰恰是后面兜底（动作恢复轮）唯一的本钱。
+         * ⚠️ 只在**计数仍在增长**时收尾：页面沉默交给下面的空闲超时。 */
+        const platformToolCount = countPlatformToolCalls(platformToolStats);
+        const platformToolsGrowing = platformToolCount > lastPlatformToolCount;
+        lastPlatformToolCount = Math.max(lastPlatformToolCount, platformToolCount);
+
         if (
-          platformSearchCount >= ChatGLMBrowserProvider.PLATFORM_SEARCH_GIVEUP_COUNT &&
-          elapsed > ChatGLMBrowserProvider.PLATFORM_SEARCH_GIVEUP_SECONDS
+          platformToolsGrowing &&
+          platformToolCount >= ChatGLMBrowserProvider.PLATFORM_TOOL_GIVEUP_COUNT &&
+          elapsed > ChatGLMBrowserProvider.PLATFORM_TOOL_GIVEUP_SECONDS
         ) {
           logger.warn(
-            `[chatglm] 本轮平台自带搜索已触发 ${platformSearchCount} 次` +
-              `（已等待 ${elapsed.toFixed(0)}s），对本地任务无价值，提前收尾把预算留给兜底`,
+            `[chatglm] 本轮平台自带工具已触发 ${platformToolCount} 次且仍在增长` +
+              `（已等待 ${elapsed.toFixed(0)}s，明细=${JSON.stringify(platformToolStats)}），` +
+              '对本地任务无价值，提前收尾把预算留给兜底',
           );
           break;
         }

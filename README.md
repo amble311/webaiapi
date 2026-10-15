@@ -1,6 +1,8 @@
 # webaiapi（命令名：`webapi`）
 
-把国产 AI 聊天网页（目前支持 **ChatGLM / 智谱清言**）包装成 **OpenAI 兼容 API**。
+**中文** | [English](https://github.com/amble311/webaiapi/blob/main/README.en.md)
+
+把 AI 聊天网页（目前支持 **ChatGLM / 智谱清言**）包装成 **OpenAI 兼容 API**。
 纯浏览器自动化（Playwright Firefox），**不需要 API Key、不需要逆向签名**——你只要在浏览器里登录一次。
 
 用它可以在任何支持 OpenAI 协议的客户端（CodeBuddy、Trae、Cursor、各类 SDK）里，
@@ -180,7 +182,7 @@ CHATGLM_MAIN_ACCOUNT=acc2 webapi start
 npm install        # 会自动 build（package.json 的 prepare 脚本）
 npm run dev        # 直接跑 tsx src/cli.ts，不用先构建
 npm run typecheck
-npm test           # 326 个单测
+npm test           # 单测（当前 466 个）
 npm run build      # 产出 dist/
 ```
 

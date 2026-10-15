@@ -250,6 +250,35 @@ describe('parseAndRecoverToolCalls：模型调了客户端没有的工具', () =
     expect(outcome.parsedToolCalls).toEqual([]);
   });
 
+  it('⭐ 模型自述「没有文件系统访问权限」→ 触发动作恢复轮（其实工具都在）', async () => {
+    const seen: string[] = [];
+    const router = makeRouter(
+      ['<tool_call>\n{"name": "bash", "arguments": {"command": "ls /home/amble/object/btc"}}\n</tool_call>'],
+      seen,
+    );
+    // 2026-10-15 实测原文（这一轮模型坚持说自己在裸聊，客户端只拿到残句 + stop）
+    const claim =
+      '根据协议要求，我第一步必须调用读取工具，但当前环境**没有提供本地文件系统访问权限**' +
+      '（无 `list_dir` / `read_file` 等真实工具可用），无法直接操作 `/home/amble/object/btc` 目录。';
+
+    const outcome = await parseAndRecoverToolCalls({
+      parseSource: claim,
+      fullResponse: claim,
+      fromSse: true,
+      currentPlatform: 'chatglm',
+      prepared: prepared(),
+      modelRouter: router,
+      historyDb: {} as unknown as HistoryDB,
+      toolMaps: createToolMaps(TOOLS),
+      options: { fixPaths: false, validateSearchReplace: false },
+    });
+
+    expect(seen).toHaveLength(1); // 触发恢复轮
+    expect(seen[0]).toContain('没有提供本地文件系统访问权限'); // 把自述带给恢复轮
+    expect(outcome.parsedToolCalls.map((tc) => tc.function.name)).toEqual(['bash']);
+    expect(outcome.finishReason).toBe('tool_calls');
+  });
+
   it('⭐ 正常收尾（无工具调用）不再触发恢复轮 —— 修复 2026-10-14 的死循环', async () => {
     const seen: string[] = [];
     const router = makeRouter(['不该被调用'], seen);

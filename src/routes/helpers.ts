@@ -350,7 +350,29 @@ export const SELF_ADMISSION_PHRASES: ReadonlyArray<string> = [
   '没有 read_file',
   '缺少文件工具',
   '只有 search',
+  // ⚠️ 2026-10-15 实测（原文）：『当前环境**没有提供本地文件系统访问权限**
+  //    （无 `list_dir` / `read_file` 等真实工具可用），无法直接操作 `/…` 目录。』
+  //    命中它就能把这一轮交给「动作恢复轮」——把真实工具清单摆回去让它重做。
+  //    以后遇到新措辞直接往这里加（这是唯一的事实来源，`detectMismatchedAnswer`
+  //    与 `findToolUnavailableClaim` 共用）。
+  '没有提供本地文件系统访问权限',
+  '没有文件系统访问权限',
+  '无文件系统访问权限',
+  '无法直接操作',
+  '没有真实的工具',
 ];
+
+/**
+ * 找模型「自认没有工具 / 读不到本地文件」的措辞（命中返回该短语，否则空串）。
+ *
+ * 用途：① 回答跑偏检测（`detectMismatchedAnswer`）说明为什么这轮跑了偏；
+ * ② **动作恢复轮的触发信号** —— 模型以为自己在裸聊、其实工具都在，这时
+ * 把它交给恢复轮（把真实工具清单摆回去）比直接把这段自述当答案有用得多。
+ */
+export function findToolUnavailableClaim(text: string): string {
+  if (!text) return '';
+  return SELF_ADMISSION_PHRASES.find((p) => text.includes(p)) ?? '';
+}
 
 /**
  * 检测「回答与本项目无关」的迹象，返回要追加到正文前的提示（无异常返回空串）。
@@ -392,7 +414,7 @@ export function detectMismatchedAnswer(text: string, workspacePath: string): str
     );
   }
 
-  const hit = SELF_ADMISSION_PHRASES.find((p) => text.includes(p));
+  const hit = findToolUnavailableClaim(text);
   if (hit) {
     return (
       `[提示] 模型自述「${hit}」：本次回答很可能**不是**基于本项目代码` +
