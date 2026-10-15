@@ -20,10 +20,11 @@
  * 会校验失败。TS 版的配置解析器（`toBool`）**自己就容错**，
  * 所以 shell 包装层不再需要，CLI 用 Node 直接跑。
  */
-import { existsSync, realpathSync } from 'node:fs';
+import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 import { settings } from './config.js';
+import { ensureFirefox, MANUAL_INSTALL_HINT } from './browser/ensure-firefox.js';
 import { listAccounts, loadAuth } from './browser/credentials.js';
 import { PLATFORM_IDS, PLATFORM_LIST } from './browser/platforms.js';
 import { logger } from './log/logger.js';
@@ -112,9 +113,11 @@ webapi —— 把国产 AI 聊天网页包装成 OpenAI 兼容接口
 平台（login / logout 不给参数时会让你选）:
 ${platformLines}
 
-首次使用（两步）:
-  1. npx playwright install firefox    下载浏览器（约 80MB，只需一次）
-  2. webapi login                         选平台 → 登录并捕获凭证（会打开可见浏览器）
+首次使用:
+  webapi login    选平台 → 登录并捕获凭证（会打开可见浏览器）
+
+  浏览器（Firefox，约 80MB）会在首次运行/安装时**自动下载**，不需要手动操作；
+  若下载失败，再手动执行: ${MANUAL_INSTALL_HINT}
 
 多账号:
   同一平台登录第二个账号即可启用「辅助通道」—— 历史压缩与工具调用转换
@@ -312,19 +315,18 @@ async function cmdDoctor(): Promise<number> {
   }
 
   console.log('\n【浏览器】');
+  // 缺了就**自动补装**（npm 11+ 默认拦截 postinstall，很多人从没下过浏览器）
   try {
-    const { firefox } = await import('playwright');
-    const exe = firefox.executablePath();
-    if (existsSync(exe)) {
-      ok(`Firefox 二进制已就绪: ${exe}`);
+    const result = ensureFirefox({ log: (message: string) => console.log(message) });
+    if (result.installed) {
+      ok(`Firefox 二进制已就绪${result.attempted ? '（本次自动补装完成）' : ''}`);
+    } else if (result.attempted) {
+      bad('Firefox 自动下载失败，对话功能不可用', MANUAL_INSTALL_HINT);
     } else {
-      bad(
-        'Firefox 二进制缺失（Playwright 不随包分发浏览器）',
-        'npx playwright install firefox',
-      );
+      bad('Firefox 二进制缺失（已按配置跳过自动下载）', MANUAL_INSTALL_HINT);
     }
   } catch (error) {
-    bad(`无法加载 playwright: ${String(error)}`, 'npm i playwright');
+    bad(`浏览器预检失败: ${String(error)}`, MANUAL_INSTALL_HINT);
   }
 
   console.log('\n【凭证】');
@@ -434,6 +436,15 @@ export async function runCli(argv: ReadonlyArray<string> = process.argv): Promis
       return cmdDoctor();
 
     case 'login': {
+      /* 登录要开可见浏览器：缺二进制时**自动补装**（npm 11+ 默认拦 postinstall，
+       * 很多人从没下过浏览器）——否则用户看到的是 Playwright 的英文报错。 */
+      const browser = ensureFirefox({ log: (message: string) => console.log(message) });
+      if (!browser.installed) {
+        console.error(
+          `\n无法启动浏览器：Firefox 二进制不可用。手动补装后重试：${MANUAL_INSTALL_HINT}\n`,
+        );
+        return 1;
+      }
       const { runLogin } = await import('./browser/login-flow.js');
       return runLogin({
         platform: strFlag(flags, 'platform') ?? positional[0],
@@ -444,6 +455,8 @@ export async function runCli(argv: ReadonlyArray<string> = process.argv): Promis
     }
 
     case 'logout': {
+      // 退出也要开浏览器清 cookie：同样自动补装（尽力而为，失败不拦）
+      ensureFirefox({ log: (message: string) => console.log(message) });
       const { runLogout } = await import('./browser/login-flow.js');
       return runLogout({
         platform: strFlag(flags, 'platform') ?? positional[0],

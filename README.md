@@ -14,9 +14,13 @@
 npm i -g webaiapi
 ```
 
-安装时会**自动下载 Playwright Firefox**（约 80MB，只需一次）。
-若你的环境禁用了安装脚本（`--ignore-scripts`）或被网络策略拦住，
-手动补一条即可：
+浏览器（Playwright Firefox，约 80MB）**会自动下载，不需要手动操作**：
+
+- 安装时会尝试下载一次（`postinstall`）；
+- ⚠️ npm 11+ 默认**拦截安装脚本**，所以**首次运行 `webapi start` / `webapi login` / `webapi doctor`
+  时会再检查一次并自动补装**；
+- 只有在网络策略拦住、或你显式设了 `WEBAIAPI_SKIP_BROWSER_INSTALL` / `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD`
+  时，才需要手动补一条：
 
 ```bash
 npx playwright install firefox

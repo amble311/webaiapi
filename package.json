@@ -1,6 +1,6 @@
 {
   "name": "webaiapi",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "把国产 AI 聊天网页（ChatGLM）包装成 OpenAI 兼容 API —— Playwright Firefox 纯浏览器自动化。命令名：webapi",
   "keywords": [
     "openai",

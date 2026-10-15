@@ -26,6 +26,7 @@ import { getHistoryDb } from '../controllers/history-db.js';
 import { getModelRouter } from '../controllers/router.js';
 import { resetApiLog } from '../log/api-logger.js';
 import { logger } from '../log/logger.js';
+import { ensureFirefox } from '../browser/ensure-firefox.js';
 import { disposeAllChannels, disposeSharedBrowser } from '../browser/manager.js';
 import { registerChatRoutes } from '../routes/chat.js';
 import { registerMetaRoutes, runStartupTasks, startPeriodicHistoryCleanup } from '../routes/meta.js';
@@ -245,21 +246,15 @@ export async function startServer(): Promise<number> {
   // 预热模型路由器（会打印账号分配与辅助通道状态，是排查「多账号有没有生效」的第一现场）
   getModelRouter();
 
-  /* ===== 浏览器二进制预检（**非致命**，只警告）=====
+  /* ===== 浏览器二进制预检 + **缺了自动补装**（非致命）=====
    * Playwright 不随包分发浏览器（Firefox 约 80MB），这是 npm 安装后最常见的
-   * 「装好了但跑不起来」。浏览器是**首次请求时才懒加载**的，若不在这里提前告警，
-   * 用户会在第一次对话失败时才发现 —— 那时错误信息埋在日志里，很难定位。
-   * 所以启动时查一次并给出可复制的修复命令，但**不阻断启动**
-   * （健康检查、/v1/models 等不需要浏览器）。 */
+   * 「装好了但跑不起来」。安装期的 `postinstall` 会下载，但 **npm 11+ 默认拦截
+   * 生命周期脚本** → 很多人根本没跑过它。所以在启动时查一次：缺了就**自动下载**，
+   * 失败才警告（**不阻断启动** —— 健康检查、/v1/models 等不需要浏览器）。 */
   try {
-    const { firefox } = await import('playwright');
-    const { existsSync } = await import('node:fs');
-    const exe = firefox.executablePath();
-    if (!existsSync(exe)) {
-      logger.warn(
-        '⚠️ 未找到 Playwright 的 Firefox 二进制，真实对话会失败。' +
-          '请运行 `npx playwright install firefox` 下载（约 80MB，只需一次）。',
-      );
+    const result = ensureFirefox({ log: (message: string) => logger.info(message) });
+    if (!result.installed) {
+      logger.warn('⚠️ Firefox 二进制不可用，真实对话会失败（健康检查 / /v1/models 不受影响）');
     }
   } catch (error) {
     logger.warn(`浏览器预检失败: ${errorMessage(error)}`);
