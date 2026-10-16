@@ -1,4 +1,4 @@
-# webaiapi (command: `webapi`)
+# webaiapi (command: `webaiapi`)
 
 [中文文档](https://github.com/amble311/webaiapi/blob/main/README.md) | **English**
 
@@ -21,7 +21,7 @@ The browser (Playwright Firefox, ~80 MB) is downloaded **automatically — no ma
 
 - `postinstall` tries once at install time;
 - ⚠️ **npm 11+ blocks lifecycle scripts by default**, so on the first run of
-  `webapi start` / `webapi login` / `webapi doctor` it checks again and installs it on demand;
+  `webaiapi start` / `webaiapi login` / `webaiapi doctor` it checks again and installs it on demand;
 - you only need the manual command below if your network policy blocks the download, or if you
   set `WEBAIAPI_SKIP_BROWSER_INSTALL` / `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD`:
 
@@ -32,17 +32,17 @@ npx playwright install firefox
 Then log in and capture the credentials (a visible browser opens; you log in by hand):
 
 ```bash
-webapi login
+webaiapi login
 ```
 
 Without arguments it asks **interactively** which platform (`↑/↓` + Enter, or type the number),
 then whether to add an account or re-login. Skip the menu by naming the platform:
-`webapi login chatglm`.
+`webaiapi login chatglm`.
 
 > Not sure your environment is OK? Run the self-check:
 
 ```bash
-webapi doctor
+webaiapi doctor
 ```
 
 It checks the Node version, the Firefox binary, credentials and the port, and prints
@@ -54,7 +54,7 @@ copy-pasteable fixes.
 ## Start
 
 ```bash
-webapi start
+webaiapi start
 ```
 
 The server listens on `http://0.0.0.0:8631` by default; the OpenAI-compatible endpoints live under `/v1`:
@@ -81,19 +81,19 @@ In your client set the base URL to `http://localhost:8631/v1`, put any string as
 
 | Command | Description |
 |---|---|
-| `webapi start` | Start the server (foreground, Ctrl-C to quit) |
-| `webapi doctor` | Self-check: Node / Firefox / credentials / port |
-| `webapi status` | Runtime state: accounts, roles, auxiliary channel, request pool |
-| `webapi accounts` | Accounts and roles only (the authoritative view for multi-account) |
-| `webapi health` | Per-platform login status |
-| `webapi login [<platform>] [--account <id>]` | Log in and capture credentials (interactive if no args) |
-| `webapi logout [<platform>] [--account <id>]` | Delete an account's credentials (interactive if no args) |
+| `webaiapi start` | Start the server (foreground, Ctrl-C to quit) |
+| `webaiapi doctor` | Self-check: Node / Firefox / credentials / port |
+| `webaiapi status` | Runtime state: accounts, roles, auxiliary channel, request pool |
+| `webaiapi accounts` | Accounts and roles only (the authoritative view for multi-account) |
+| `webaiapi health` | Per-platform login status |
+| `webaiapi login [<platform>] [--account <id>]` | Log in and capture credentials (interactive if no args) |
+| `webaiapi logout [<platform>] [--account <id>]` | Delete an account's credentials (interactive if no args) |
 
 Non-interactive usage for scripts / CI (`--yes` skips the confirmation):
 
 ```bash
-webapi login chatglm --account acc2 --yes
-webapi logout chatglm --account acc2 --yes
+webaiapi login chatglm --account acc2 --yes
+webaiapi logout chatglm --account acc2 --yes
 ```
 
 ## Models
@@ -110,11 +110,11 @@ With a second account the server enables the **auxiliary channel**: background w
 (history compaction, tool-call conversion) runs on a separate page under the other account and
 truly runs **in parallel** with your main conversation instead of queueing behind it.
 
-Run `webapi login` again and pick “add a new account”. **Account names are derived from the
+Run `webaiapi login` again and pick “add a new account”. **Account names are derived from the
 logged-in identity** (username → uid), so you don't invent them:
 
 ```bash
-webapi login
+webaiapi login
 #   Which platform?        → ChatGLM
 #   What do you want to do? → ➕ Add a new account
 #   ...log in with the other account...
@@ -123,7 +123,7 @@ webapi login
 
 You can always back out: the second-level menu has `← Back (choose platform again)` and the
 platform menu has `✗ Quit`; `Esc` / `Ctrl+C` cancel at any time.
-(When you name the platform explicitly, `webapi login <platform>`, the menu offers `✗ Cancel` —
+(When you name the platform explicitly, `webaiapi login <platform>`, the menu offers `✗ Cancel` —
 there is no previous step to return to.)
 
 > ⚠️ **The two accounts must belong to different people.** The system browser very likely still
@@ -134,11 +134,11 @@ there is no previous step to return to.)
 > - same session as an existing account → it asks you to *update that account / save as a new one / cancel*;
 > - non-interactively (scripts) it **updates the existing account** and never silently creates a duplicate.
 
-Check identities and role assignment with `webapi accounts`. The main/aux roles are assigned
+Check identities and role assignment with `webaiapi accounts`. The main/aux roles are assigned
 **randomly at startup** to spread quota usage; pin them with an environment variable:
 
 ```bash
-CHATGLM_MAIN_ACCOUNT=acc2 webapi start
+CHATGLM_MAIN_ACCOUNT=acc2 webaiapi start
 ```
 
 ## Configuration
@@ -167,7 +167,7 @@ Credentials, the history database and debug logs all live under `~/.ai-api/`.
 
 **“请求过于频繁，请稍后再试” (too many requests)**
 Usually it means **you are not logged in** (the guest quota is exhausted). Log in again:
-`webapi login chatglm`.
+`webaiapi login chatglm`.
 
 **The captured account is not the one I wanted**
 The system browser often still holds the previous account's session. Log out on that page first,

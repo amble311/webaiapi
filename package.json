@@ -1,7 +1,7 @@
 {
   "name": "webaiapi",
-  "version": "0.1.2",
-  "description": "Wrap AI chat web UIs (ChatGLM) into an OpenAI-compatible API — Playwright Firefox automation, no API key needed. 把 AI 聊天网页包装成 OpenAI 兼容 API（命令名：webapi）",
+  "version": "0.1.3",
+  "description": "Wrap AI chat web UIs (ChatGLM) into an OpenAI-compatible API — Playwright Firefox automation, no API key needed. 把 AI 聊天网页包装成 OpenAI 兼容 API（命令名：webaiapi）",
   "keywords": [
     "openai",
     "api-gateway",
@@ -10,7 +10,7 @@
     "browser-automation",
     "llm",
     "cli",
-    "webapi"
+    "webaiapi"
   ],
   "license": "MIT",
   "type": "module",
@@ -18,7 +18,7 @@
     "node": ">=20.11"
   },
   "bin": {
-    "webapi": "bin/webapi.mjs"
+    "webaiapi": "bin/webaiapi.mjs"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

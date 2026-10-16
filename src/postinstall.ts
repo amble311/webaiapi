@@ -12,7 +12,7 @@
  * ## ⚠️ 这层**不可靠**（2026-10-15）
  * **npm 11+ 默认拦截生命周期脚本**（安装时只提示 `npm install-scripts approve`，
  * 不执行），所以 postinstall 常常压根没跑。真正的保障是**运行时自动补装**：
- * `webapi start` / `webapi login` / `webapi doctor` 都会调
+ * `webaiapi start` / `webaiapi login` / `webaiapi doctor` 都会调
  * `ensureFirefox()` 再检查一次并自动下载。这里只是「提前做完」的优化。
  *
  * ## 三条原则

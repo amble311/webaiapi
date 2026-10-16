@@ -13,7 +13,7 @@ import {
  *
  * 背景（2026-10-15）：`postinstall` 会自动下载 Firefox，但 **npm 11+ 默认拦截
  * 生命周期脚本** → 用户装完仍然撞「Executable doesn't exist」。所以
- * `webapi start` / `login` / `doctor` 都要在真用浏览器之前再补一次。
+ * `webaiapi start` / `login` / `doctor` 都要在真用浏览器之前再补一次。
  */
 describe('skipBrowserInstallReason', () => {
   it('两个开关都认（本包逃生口 + Playwright 约定）', () => {

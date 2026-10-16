@@ -8,7 +8,7 @@
  * 「Executable doesn't exist at …/firefox-1555/firefox/firefox」。
  *
  * 结论：**不能只依赖 postinstall**。这里提供一个同步、幂等、绝不抛异常的入口，
- * 在真正要用浏览器之前（`webapi start` / `webapi login` / `webapi doctor`）调一次：
+ * 在真正要用浏览器之前（`webaiapi start` / `webaiapi login` / `webaiapi doctor`）调一次：
  * - 已就绪 → 一次 `existsSync`，零开销直接返回；
  * - 缺失 → 打印进度并自动执行 `node <playwright>/cli.js install firefox`
  *   （⚠️ **不能用 `npx playwright`**：全局安装时 `node_modules/.bin` 不在 PATH 上，

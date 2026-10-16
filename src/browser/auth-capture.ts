@@ -19,12 +19,20 @@
  *   但不做逐条交互 —— 当前只有 chatglm 一个平台，且它用 Cookie 认证。
  */
 import { copyFileSync, existsSync, mkdirSync, renameSync, writeFileSync, chmodSync } from 'node:fs';
-import { createInterface } from 'node:readline';
 
 import { firefox, type Browser, type BrowserContext, type Page, type Request } from 'playwright';
 
 import { logger } from '../log/logger.js';
-import { iife } from './js-eval.js';
+import { STEALTH_JS } from './stealth.js';
+import { isInteractive } from '../utils/prompt.js';
+import { evaluateFn, iife } from './js-eval.js';
+import {
+  isLoginHintAction,
+  loginHintContent,
+  loginHintJs,
+  looksLoggedIn,
+  removeLoginHintJs,
+} from './login-hint.js';
 import {
   authBaseDir,
   authFilePath,
@@ -40,6 +48,19 @@ import {
   extractAccountInfoSync,
 } from './platforms.js';
 
+/**
+ * 用户在**页面上点了「✕ 取消」**（或等价操作）。
+ *
+ * 调用方（`login-flow.ts`）按「未写入任何文件」处理 —— 不要打印成「捕获失败」，
+ * 那是我们自己的功能失败，而这是用户的正常选择。
+ */
+export class LoginCancelledError extends Error {
+  constructor() {
+    super('用户取消了登录（未写入任何凭证）');
+    this.name = 'LoginCancelledError';
+  }
+}
+
 /** 仅所有者可读写（凭证是敏感信息，与 Python 的 chmod 0o600 一致）。 */
 const AUTH_FILE_MODE = 0o600;
 
@@ -53,17 +74,6 @@ export interface CapturedAuth extends AuthRecord {
   platform?: string;
   account_info?: AccountInfo;
   sample_requests?: Array<Record<string, unknown>>;
-}
-
-/** 交互式提问（等价于 Python 的 `input()`）。 */
-function ask(question: string): Promise<string> {
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise((resolve) => {
-    rl.question(question, (answer) => {
-      rl.close();
-      resolve(answer);
-    });
-  });
 }
 
 /* ==================================================================== */
@@ -175,7 +185,12 @@ export interface AuthCaptureOptions {
   authDir?: string;
   /** 是否无头。凭证捕获**建议 false**（用户需要看到浏览器才能登录）。 */
   headless?: boolean;
-  /** 捕获超时（秒）。目前仅用于提示，实际由用户的 Enter 决定。 */
+  /**
+   * 等待登录的超时（秒）。
+   *
+   * ⚠️ 2026-10-16 起它是**真正生效**的上限：登录完成靠自动检测（或用户按回车）判定，
+   * 超时后仍会尝试捕获现有凭证（用户可能登成了、但信号我们没识别出来）。
+   */
   captureTimeout?: number;
   /** 账号 ID（同平台多账号）。 */
   accountId?: string;
@@ -217,6 +232,9 @@ export class AuthCapture {
   private page: Page | null = null;
 
   readonly capturedAuth: CapturedAuth = {};
+
+  /** 页面按钮最近回传的动作（刷新循环从 DOM 属性读到后写入，由等待循环处理）。 */
+  private pendingAction: 'done' | 'reload' | 'cancel' | null = null;
 
   constructor(platform: string, options: AuthCaptureOptions = {}) {
     this.platform = platform;
@@ -278,6 +296,22 @@ export class AuthCapture {
       this.context = await this.browser.newContext();
       this.page = await this.context.newPage();
 
+      /* ⚠️ 登录页也必须注入 STEALTH（2026-10-16 实测）：
+       * 干净上下文里 `navigator.webdriver === true` —— 滑块/图形验证最经典的
+       * 一票否决项，用户实测「滑动验证始终过不了」就是它
+       * （STEALTH 原来只在聊天页注入）。它同时修补 plugins / languages / permissions 等指纹。
+       * 必须在导航**之前**注入。 */
+      try {
+        await this.context.addInitScript({ content: STEALTH_JS });
+      } catch (error) {
+        logger.debug(`注入 STEALTH 失败（登录仍可进行，但可能撞人机验证）: ${String(error)}`);
+      }
+
+      /* 页面按钮的动作走 **HTML 属性**回传（不用 `exposeBinding`：它会往页面塞可枚举的
+       * `__playwright__binding__`，反爬 `for…in` 一眼看到）。动作在 `waitForLogin`
+       * 的刷新循环里读取，且**白名单校验**（`isLoginHintAction`）。 */
+      this.pendingAction = null;
+
       // 监听所有请求，抓 Authorization 与样本请求
       this.page.on('request', (request) => {
         this.onRequest(request).catch(() => {
@@ -285,27 +319,50 @@ export class AuthCapture {
         });
       });
 
-      logger.info('='.repeat(60));
-      logger.info(`【第 1 步】准备登录 ${platformName}`);
-      logger.info(`超时时间: ${this.captureTimeout} 秒`);
-      logger.info('='.repeat(60));
-      await ask('准备好登录了吗？按 Enter 继续（或按 Ctrl+C 取消）...');
+      /* 引导**只放在页面里**（2026-10-16 改）：
+       * 用户此时盯着的是浏览器，终端上的「请回终端按回车」根本看不见
+       * （何况登录期间每个 API 请求都会打一行日志把终端刷满）。
+       * 所以：页面上一条悬浮横幅写明步骤，终端只留一行会原地刷新的进度。 */
+      const warnExistingSession = listAccounts(this.platform, this.authDirOption).length > 0;
+      const waitOptions = {
+        platformName,
+        timeoutSeconds: this.captureTimeout,
+        warnExistingSession,
+      };
 
-      logger.info(`导航到登录页: ${loginUrl}`);
+      // `addInitScript` 保证**每次导航后**横幅还在（登录成功常伴随跳转/刷新）
+      await this.page.addInitScript({
+        content: iife(loginHintJs(loginHintContent({ ...waitOptions, elapsedSeconds: 0 }))),
+      });
+
+      logger.info(
+        `正在打开 ${platformName} 登录页，浏览器里会显示操作引导` +
+          `（登录成功后**自动继续**，不需要回终端按回车；最多等 ${this.captureTimeout}s）`,
+      );
       await this.page.goto(loginUrl, { waitUntil: 'domcontentloaded' });
+      await this.applyLoginHint(loginHintContent({ ...waitOptions, elapsedSeconds: 0 }));
 
-      logger.info('='.repeat(60));
-      logger.info(`【第 2 步】请在 ${platformName} 页面中完成登录`);
-      logger.info('登录成功后（页面刷新或显示已登录状态），按 Enter 完成');
-      // ⚠️ 头号坑：系统 Firefox 常已是**旧账号**的登录态 → 抓到同一个人。
-      //    加第二个账号前必须先在浏览器里退出登录。
-      logger.warn('⚠️ 若要添加**第二个账号**，请先在该页面退出登录，再登录目标账号；');
-      logger.warn('   否则抓到的还是上一个人（捕获结束后会打印身份供你核对）。');
-      logger.info('='.repeat(60));
-      await ask('是否登录完成？按 Enter 完成（或按 Ctrl+C 取消）...');
+      const reason = await this.waitForLogin({ ...waitOptions, loginUrl });
+      this.clearProgressLine();
 
-      logger.info('等待页面加载完成...');
-      await sleep(3000);
+      if (reason === 'detected') {
+        logger.info('✓ 已自动检测到登录完成');
+      } else if (reason === 'manual') {
+        logger.info('✓ 已确认登录完成（页面按钮「我已登录，继续」或终端回车）');
+        await sleep(1000); // 让最后一次请求把 bearer 带回来
+      } else if (reason === 'cancel') {
+        logger.warn('已按「取消」终止登录，未写入任何凭证');
+        throw new LoginCancelledError();
+      } else {
+        logger.warn(
+          `⚠️ 等待 ${this.captureTimeout}s 未检测到登录，仍尝试捕获现有凭证` +
+            '（若身份不对，请重跑 `webaiapi login`）',
+        );
+      }
+
+      await this.applyLoginHint(
+        loginHintContent({ ...waitOptions, elapsedSeconds: 0, tone: 'done' }),
+      );
 
       await this.captureCookiesAndUa();
       logger.info(`✓ 已捕获 ${this.capturedAuth.cookies?.length ?? 0} 个 cookies`);
@@ -326,10 +383,168 @@ export class AuthCapture {
       }
 
       if (this.saveOnCapture) this.saveAuth();
+      await this.dropLoginHint();
       return this.capturedAuth;
     } finally {
       await this.cleanup();
     }
+  }
+
+  /* ================================================================== */
+  /* 登录引导与等待（2026-10-16）                                        */
+  /* ================================================================== */
+
+  /**
+   * 把引导横幅画到当前页面上（幂等；失败不影响主流程）。
+   *
+   * @returns 页面按钮刚回传的动作（**读走即清除**，无动作时为空串）。
+   *          一次 evaluate 同时完成「刷新横幅 + 取动作」，省一次往返。
+   */
+  private async applyLoginHint(content: ReturnType<typeof loginHintContent>): Promise<string> {
+    if (!this.page) return '';
+    try {
+      const action = await evaluateFn<unknown>(this.page, loginHintJs(content));
+      return typeof action === 'string' ? action : '';
+    } catch (error) {
+      logger.debug(`注入登录引导失败（不影响流程）: ${String(error)}`);
+      return '';
+    }
+  }
+
+  /** 横幅已经不需要了（落盘后调用；关浏览器时也会随之消失）。 */
+  private async dropLoginHint(): Promise<void> {
+    if (!this.page) return;
+    try {
+      await evaluateFn(this.page, removeLoginHintJs());
+    } catch {
+      // 忽略
+    }
+  }
+
+  /**
+   * 凭证里是否已经出现**真实登录身份**（= 登录完成）。
+   *
+   * 判据本身在 `login-hint.ts::looksLoggedIn`（纯函数、有单测）；
+   * 这里只负责取当前 cookies，并把顺手拿到的快照留在 `capturedAuth` 里。
+   */
+  private async detectLoggedIn(): Promise<boolean> {
+    if (!this.context) return false;
+    try {
+      const cookies = await this.context.cookies();
+      const snapshot: AuthRecord = {
+        cookies: cookies as unknown as AuthRecord['cookies'],
+        cookie_str: cookies.map((c) => `${c.name}=${c.value}`).join('; '),
+        // bearer 由请求监听器异步抓到，此刻可能已经有了
+        bearer: this.capturedAuth.bearer,
+      };
+      if (!looksLoggedIn(this.platform, snapshot)) return false;
+      // 顺手留下 cookies，省掉后面一次往返
+      this.capturedAuth.cookies = snapshot.cookies;
+      this.capturedAuth.cookie_str = snapshot.cookie_str;
+      return true;
+    } catch (error) {
+      logger.debug(`登录检测出错（继续等）: ${String(error)}`);
+      return false;
+    }
+  }
+
+  /**
+   * 等用户完成登录。
+   *
+   * 三个并行信号，谁先到用谁：
+   * 1. **自动检测**：每 2s 看凭证里是否出现真实身份 → `detected`；
+   * 2. **手动确认** → `manual`：页面按钮「✓ 我已登录，继续」，或终端按一次回车。
+   *    ⚠️ 回车只在 **cooked 模式**下监听 `stdin` 的 `data`
+   *    （回车才会触发一次），**不开 raw 模式** —— raw 模式下 Ctrl+C 不再触发 SIGINT，
+   *    我们绝不能剥夺用户唯一的中断手段；
+   * 3. **取消** → `cancel`：页面按钮「✕ 取消」。
+   * 4. **超时** → `timeout`（照样往下捕获：用户可能登成了，只是信号没被我们识别）。
+   *
+   * 每次轮询都会刷新页面横幅（含已等待秒数），所以页面上的提示始终是活的。
+   */
+  private async waitForLogin(options: {
+    platformName: string;
+    timeoutSeconds: number;
+    warnExistingSession: boolean;
+    loginUrl: string;
+  }): Promise<'detected' | 'manual' | 'cancel' | 'timeout'> {
+    const { platformName, timeoutSeconds, warnExistingSession, loginUrl } = options;
+    const startedAt = Date.now();
+    const timeoutMs = Math.max(30, timeoutSeconds) * 1000;
+    const pollMs = 2000;
+
+    let enterPressed = false;
+    const onStdinData = (): void => {
+      enterPressed = true;
+    };
+    const listenStdin = Boolean(process.stdin.isTTY);
+    if (listenStdin) {
+      process.stdin.resume();
+      process.stdin.on('data', onStdinData);
+    }
+
+    try {
+      for (;;) {
+        const elapsed = (Date.now() - startedAt) / 1000;
+
+        /* 0) 页面按钮：用户已经明确表态，优先级最高 */
+        if (this.pendingAction === 'cancel') return 'cancel';
+        if (this.pendingAction === 'done') return 'manual';
+        if (this.pendingAction === 'reload') {
+          this.pendingAction = null;
+          logger.info('按页面按钮「重开登录页」重新导航');
+          try {
+            await this.page?.goto(loginUrl, { waitUntil: 'domcontentloaded' });
+          } catch (error) {
+            logger.debug(`重开登录页失败: ${String(error)}`);
+          }
+          await sleep(500);
+          continue;
+        }
+
+        if (await this.detectLoggedIn()) return 'detected';
+        if (enterPressed) return 'manual';
+        if (Date.now() - startedAt >= timeoutMs) return 'timeout';
+
+        const action = await this.applyLoginHint(
+          loginHintContent({
+            platformName,
+            elapsedSeconds: elapsed,
+            timeoutSeconds,
+            warnExistingSession,
+          }),
+        );
+        if (isLoginHintAction(action)) {
+          logger.info(`[login] 页面按钮: ${action}`);
+          this.pendingAction = action;
+          continue; // 立刻回到循环顶部处理，不白等一个轮询周期
+        }
+        this.printWaitingLine(platformName, elapsed, timeoutSeconds);
+        await sleep(pollMs);
+      }
+    } finally {
+      if (listenStdin) {
+        process.stdin.off('data', onStdinData);
+        process.stdin.pause();
+      }
+    }
+  }
+
+  /** 终端上那**一行**等待进度（TTY 原地刷新；非 TTY 每 15s 一条，避免刷屏）。 */
+  private printWaitingLine(platformName: string, elapsed: number, timeoutSeconds: number): void {
+    const text =
+      `⏳ 等待 ${platformName} 登录… ${Math.round(elapsed)}s / ${timeoutSeconds}s` +
+      '（登录后自动继续，也可按回车立即完成）';
+    if (isInteractive()) {
+      process.stdout.write(`\r${text}   `);
+    } else if (Math.round(elapsed) % 15 === 0) {
+      logger.info(text);
+    }
+  }
+
+  /** 清掉终端上那行原地刷新的进度（否则会和后续日志糊在一起）。 */
+  private clearProgressLine(): void {
+    if (isInteractive()) process.stdout.write(`\r${' '.repeat(100)}\r`);
   }
 
   /** 请求回调：抓 bearer / 额外请求头 / 样本请求。 */
@@ -396,7 +611,8 @@ export class AuthCapture {
           headers,
           body: request.postData() ?? null,
         });
-        logger.info(`✓ 记录样本请求: ${request.method()} ${url.slice(0, 120)}`);
+        // ⚠️ 这里是终端刷屏的主因（登录期间每个 API 请求都会打一行）→ 降为 debug
+        logger.debug(`✓ 记录样本请求: ${request.method()} ${url.slice(0, 120)}`);
       }
     } catch (error) {
       logger.debug(`处理请求事件出错: ${String(error)}`);

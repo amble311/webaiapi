@@ -274,9 +274,9 @@ export async function startServer(): Promise<number> {
       logger.error(
         `端口 ${settings.apiPort} 已被占用（${pid ? `进程 ${pid}` : '可能有另一个实例在跑'}）。` +
           '\n  处理方式任选：' +
-          '\n  1. 直接用已在跑的那个实例（`webapi status` 可查看）；' +
+          '\n  1. 直接用已在跑的那个实例（`webaiapi status` 可查看）；' +
           `\n  2. 停掉它再启动：kill ${pid ?? '<pid>'}；` +
-          `\n  3. 换个端口：API_PORT=${settings.apiPort + 1} webapi start`,
+          `\n  3. 换个端口：API_PORT=${settings.apiPort + 1} webaiapi start`,
       );
       // ⚠️ 返回退出码而不是设 `process.exitCode`：CLI 侧会执行
       //    `process.exitCode = await runCli()`，把这里设的值**覆盖回 0**

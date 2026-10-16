@@ -1,5 +1,5 @@
 /**
- * 交互式命令行提问工具（`webapi login` / `webapi logout` 用）。
+ * 交互式命令行提问工具（`webaiapi login` / `webaiapi logout` 用）。
  *
  * ## 为什么不引入 `prompts` / `inquirer`
  * 本项目刻意保持**零运行时依赖**（见 `package.json`）。为了两个菜单拉一棵依赖树
@@ -15,7 +15,7 @@
  * **纯粹的分支判断**上 —— 拆出来就能直接喂字符串测，不用碰终端。
  *
  * ## ⚠️ 非 TTY 必须有降级路径
- * `webapi login < ...`（管道）、CI、被其他脚本调用时 `stdin` 不是 TTY。
+ * `webaiapi login < ...`（管道）、CI、被其他脚本调用时 `stdin` 不是 TTY。
  * 此时 raw mode 不可用（`setRawMode` 直接抛错），**绝不能**硬走交互渲染 ——
  * 那种情况下进程会卡住等一个永远不会来的按键。这里统一退化成
  * 「打印带编号的列表 + 读一行」，与 TTY 路径共用同一套 {@link resolveChoiceInput} 判定。
@@ -30,7 +30,7 @@ import { createInterface } from 'node:readline';
  * 是否输出 ANSI 颜色。
  *
  * 遵循 `NO_COLOR` 约定（https://no-color.org），且只在输出为 TTY 时上色 ——
- * 否则 `webapi login > log.txt` 会把转义序列写进文件。
+ * 否则 `webaiapi login > log.txt` 会把转义序列写进文件。
  */
 export function supportsColor(): boolean {
   if (process.env['NO_COLOR']) return false;
