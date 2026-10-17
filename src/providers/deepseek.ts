@@ -34,6 +34,11 @@ import {
   peekPage,
 } from '../browser/manager.js';
 import { loadAuth, updateAuthBearer } from '../browser/credentials.js';
+import {
+  classifyLoginState,
+  initTokenJs,
+  probeSessionJs,
+} from '../browser/deepseek-session.js';
 import { PlatformUnavailableError } from '../utils/errors.js';
 import { RESET_SSE_JS, SSE_GET_JS } from '../browser/sse-capture.js';
 import { evaluateFn } from '../browser/js-eval.js';
@@ -112,29 +117,6 @@ const READ_TOKEN_JS = `() => {
 }`;
 
 /**
- * 「**启动前**种 token」的注入脚本内容（`context.addInitScript`）。
- *
- * ⚠️ 网页端的存储格式实测是 `{"value":"<bearer>","__version":"0"}`；
- * 页面启动时读它 → 必须在应用初始化**之前**写好，运行中写会被应用清掉。
- *
- * ⚠️⚠️ **只在页面没有任何 token 时才写**（2026-10-16 实测事故）：
- * deepseek 会**轮换 token**（`/api/v0/users/current` 的响应里就带 `token` 字段），
- * 页面 localStorage 里那份是**应用自己刷新出来的、更新的** token，与凭证文件里的不同属正常。
- * 早期版本无条件覆盖 → 每次导航都把应用的新 token 打死 → 页面进不去 / 没有输入框
- * （用户报「模型突然不可用」，日志里是反复的「token 与凭证不一致 → 重载」）。
- */
-export function initTokenJs(token: string): string {
-  return `(() => {
-  try {
-    const cur = localStorage.getItem('userToken') || '';
-    // 页面已持有 token（可能是应用刷新出的更新版本）→ 绝不覆盖
-    if (cur.length > 2) return;
-    localStorage.setItem('userToken', JSON.stringify({ value: ${JSON.stringify(token)}, __version: '0' }));
-  } catch (e) {}
-})()`;
-}
-
-/**
  * 「已判定失效」的标记是否仍然有效（**纯函数**，便于单测）。
  *
  * 语义：标记**绑定到当时的 bearer** ——
@@ -146,58 +128,8 @@ export function isExpiryStillValid(recordedBearer: string | null, currentBearer:
   return recordedBearer === currentBearer;
 }
 
-/**
- * 页面登录态分类（**纯函数**，便于单测）。
- *
- * | 返回 | 含义 | 处理 |
- * |---|---|---|
- * | `ok` | 页面有自己的 token 且 API 认 | 正常继续 |
- * | `expired` | 跳到 `/sign_in`、没有 token，或 API 明确拒绝（含 40002 Missing Token） | 补种一次；仍失效就报错停止 |
- * | `unknown` | 请求本身失败（网络/WAF），判断不了 | **不拦**（避免网络抖动误杀整个账号） |
- */
-export function classifyLoginState(input: {
-  path: string;
-  hasToken: boolean;
-  code: number | null;
-}): 'ok' | 'expired' | 'unknown' {
-  if (String(input.path || '').includes('sign_in')) return 'expired';
-  if (!input.hasToken) return 'expired';
-  if (input.code === 0) return 'ok';
-  if (input.code === null) return 'unknown';
-  return 'expired';
-}
-
-/** 页面内探测登录态 + 顺手取平台刷新出的新 token（不抛错，失败返回 unknown）。 */
-function probeSessionJs(): string {
-  return `async () => {
-  let token = '';
-  try {
-    const raw = JSON.parse(localStorage.getItem('userToken') || '{}');
-    token = String((raw && raw.value) || '');
-  } catch (e) {}
-  const path = String(location.pathname || '');
-  if (!token) return { path, hasToken: false, code: null, token: '' };
-  try {
-    /* ⚠️ 页面内 fetch 不会自动带 Authorization（应用的封装才会加头）。 */
-    const r = await fetch('/api/v0/users/current', {
-      headers: { authorization: 'Bearer ' + token, accept: 'application/json' },
-      credentials: 'include',
-      cache: 'no-store',
-    });
-    if (!r.ok) return { path, hasToken: true, code: -1, token: '' };
-    const d = await r.json();
-    const biz = (d && d.data && d.data.biz_data) || {};
-    return {
-      path,
-      hasToken: true,
-      code: typeof d.code === 'number' ? d.code : -1,
-      token: String(biz.token || ''),
-    };
-  } catch (e) {
-    return { path, hasToken: true, code: null, token: '' };
-  }
-}`;
-}
+/** 供测试与外部复用：这两个判据已移到 browser 层的 `deepseek-session.ts`。 */
+export { classifyLoginState, initTokenJs } from '../browser/deepseek-session.js';
 
 /** 页面上是否出现了「忙 / 限流」提示。 */
 const BUSY_TEXT_JS = `() => {
@@ -389,10 +321,12 @@ export class DeepSeekBrowserProvider extends BaseProvider {
 
     if (this.tokenInitInstalledFor !== this.accountId) {
       try {
-        await page.context().addInitScript({ content: initTokenJs(token) });
+        /* ⚠️ force=true：这是**给某个账号新装**脚本 —— 同一个 context 里可能还挂着
+         * 上一个账号的脚本（它会先把旧 token 写进去），不强制覆盖就会继续用别人的 token。 */
+        await page.context().addInitScript({ content: initTokenJs(token, true) });
         this.tokenInitInstalledFor = this.accountId;
         needReload = true;
-        logger.info('[deepseek] 已注入「启动前种 token」脚本（登录态依赖它）');
+        logger.info(`[deepseek] 已注入「启动前种 token」脚本（账号 ${this.accountId}，强制覆盖）`);
       } catch (error) {
         logger.warn(`[deepseek] 注入 token 脚本失败: ${String(error)}`);
       }

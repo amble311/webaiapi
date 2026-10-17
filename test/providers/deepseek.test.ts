@@ -78,7 +78,8 @@ describe('token 注入脚本（只种不覆盖）', () => {
 
   it('⭐ 带「已有 token 就直接返回」的守卫', () => {
     expect(js).toContain("localStorage.getItem('userToken')");
-    expect(js).toContain('if (cur.length > 2) return');
+    // 默认（不强制）时保留守卫；切换账号时才走 force（见下面的 force 组）
+    expect(js).toContain('cur.length > 2) return');
   });
 
   it('凭证 token 被内联进脚本（首次引导用）', () => {
@@ -139,5 +140,25 @@ describe('isExpiryStillValid', () => {
 
   it('没有标记 → false（正常尝试）', () => {
     expect(isExpiryStillValid(null, 'BEARER_A')).toBe(false);
+  });
+});
+
+/**
+ * ⭐ 切换账号时必须**强制覆盖** token（2026-10-17 实测风险）。
+ *
+ * 场景：同一个 context 在主通道的两个账号间轮换（或故障转移）—— 旧账号的注入脚本先执行、
+ * 已把 token 写进 localStorage；新账号的脚本若也遵守「只在没有 token 时写」，
+ * 就会直接返回 → **新账号继续用旧账号的 token**（会话互相顶掉 / 身份串号）。
+ */
+describe('initTokenJs 的 force 语义', () => {
+  it('⭐ force=true 时不带「已有 token 就返回」的守卫（用于切换账号）', () => {
+    const js = initTokenJs('TOKEN_B', true);
+    expect(js).toContain('if (!true && cur.length > 2) return;');
+    expect(js).toContain('TOKEN_B');
+  });
+
+  it('默认（force=false）仍保留守卫（同一账号的普通重载不覆盖应用刷新的新 token）', () => {
+    const js = initTokenJs('TOKEN_A');
+    expect(js).toContain('if (!false && cur.length > 2) return;');
   });
 });

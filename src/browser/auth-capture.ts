@@ -25,6 +25,7 @@ import { firefox, type Browser, type BrowserContext, type Page, type Request } f
 import { logger } from '../log/logger.js';
 import { parseDeepseekUserInfo, platformDisplayName } from './platforms.js';
 import { STEALTH_JS } from './stealth.js';
+import { classifyLoginState, initTokenJs, probeSessionJs } from './deepseek-session.js';
 import { isInteractive } from '../utils/prompt.js';
 import { evaluateFn, iife } from './js-eval.js';
 import {
@@ -42,6 +43,8 @@ import {
   listAccounts,
   type AccountInfo,
   type AuthRecord,
+  loadAuth,
+  normalizeCookies,
 } from './credentials.js';
 import {
   PLATFORM_API_PATTERNS,
@@ -265,6 +268,15 @@ export interface AuthCaptureOptions {
    */
   saveOnCapture?: boolean;
   /**
+   * **选中已有账号时**先用保存的凭证试一次登录（2026-10-17 用户要求）：
+   * 凭证仍有效 → 直接跳过登录（省掉手工输密码）；失效 → 才打开登录页。
+   *
+   * 判定口径按平台：deepseek 看**页面会话**（`classifyLoginState`），
+   * 其它平台看 user-info API（`fetchAccountInfo`）—— 不能一律用 API，
+   * deepseek 的旧 token 打 API 仍 200，但网页会话可能已作废（实测）。
+   */
+  reuseSavedCredential?: boolean;
+  /**
    * 捕获成功后是否**保持浏览器打开**，等调用方显式调用 {@link AuthCapture.finish}
    * 或 {@link AuthCapture.dispose} 再关（默认 `false` = 老行为：立刻关）。
    *
@@ -313,6 +325,9 @@ export class AuthCapture {
    */
   private readonly keepAlive: boolean;
 
+  /** 选中的是已有账号时，先用保存的凭证试登录（{@link AuthCaptureOptions.reuseSavedCredential}）。 */
+  private readonly reuseSavedCredential: boolean;
+
   /** 只有**成功捕获**后才置位 —— 失败/取消路径照样关掉浏览器（不留孤儿窗口）。 */
   private keepAliveArmed = false;
 
@@ -324,6 +339,7 @@ export class AuthCapture {
     this.headless = options.headless ?? false;
     this.captureTimeout = options.captureTimeout ?? 600;
     this.keepAlive = options.keepAlive === true;
+    this.reuseSavedCredential = options.reuseSavedCredential === true;
 
     this.authDir = authBaseDir(options.authDir);
     mkdirSync(this.authDir, { recursive: true });
@@ -399,6 +415,41 @@ export class AuthCapture {
           // 回调里的异常不能冒泡
         });
       });
+
+      /* ⚠️ **选中已有账号时，先用保存的凭证试一次**（2026-10-17 用户要求）：
+       * 凭证还有效 → **跳过登录**；失效 → 才打开登录页（不要一上来就给空白登录页）。 */
+      if (this.reuseSavedCredential && this.accountId && this.accountId !== '__pending__') {
+        const saved = loadAuth(this.platform, {
+          accountId: this.accountId,
+          authDir: this.authDirOption,
+        });
+        if (saved && (saved.cookies ?? []).length > 0) {
+          logger.info(`先用已保存的凭证试一下（账号 ${this.accountId}）…`);
+          try {
+            await this.context.addCookies(
+              normalizeCookies(saved.cookies) as Parameters<BrowserContext['addCookies']>[0],
+            );
+            /* deepseek 的登录态在 localStorage（必须在**页面启动前**注入） */
+            if (this.platform === 'deepseek' && saved.bearer) {
+              await this.context.addInitScript({ content: initTokenJs(String(saved.bearer)) });
+            }
+            await this.page.goto(loginUrl, { waitUntil: 'domcontentloaded' });
+            await sleep(3000);
+
+            if (await this.probeSavedCredential(saved)) {
+              logger.info('✓ 已保存的凭证仍然有效 → 跳过登录');
+              await this.collectFromContext(saved);
+              if (this.saveOnCapture) this.saveAuth();
+              if (this.keepAlive) this.keepAliveArmed = true;
+              else await this.dropLoginHint();
+              return this.capturedAuth;
+            }
+            logger.info('已保存的凭证已失效 → 打开登录页重新登录');
+          } catch (error) {
+            logger.warn(`用已保存凭证试登录失败（继续走登录页）: ${String(error)}`);
+          }
+        }
+      }
 
       /* 引导**只放在页面里**（2026-10-16 改）：
        * 用户此时盯着的是浏览器，终端上的「请回终端按回车」根本看不见
@@ -482,6 +533,49 @@ export class AuthCapture {
   /* ================================================================== */
   /* 登录引导与等待（2026-10-16）                                        */
   /* ================================================================== */
+
+  /**
+   * 已保存的凭证是否仍然可用。
+   *
+   * ⚠️ 不能一律用 `fetchAccountInfo`：deepseek 的**旧 token 打 API 仍然 200**，
+   * 但网页会话可能已被作废（实测）—— 所以它要看页面会话（`classifyLoginState`）。
+   */
+  private async probeSavedCredential(saved: AuthRecord): Promise<boolean> {
+    if (!this.page) return false;
+    try {
+      if (this.platform === 'deepseek') {
+        const raw = await evaluateFn<{ path?: string; hasToken?: boolean; code?: number | null }>(
+          this.page,
+          probeSessionJs(),
+        ).catch(() => null);
+        if (!raw) return false;
+        return (
+          classifyLoginState({
+            path: String(raw.path ?? ''),
+            hasToken: Boolean(raw.hasToken),
+            code: typeof raw.code === 'number' ? raw.code : null,
+          }) === 'ok'
+        );
+      }
+
+      const info = await fetchAccountInfo(this.platform, saved, this.page);
+      return Boolean(String(info.label ?? '').trim() || String(info.identifier ?? '').trim());
+    } catch (error) {
+      logger.debug(`探测已保存凭证失败: ${String(error)}`);
+      return false;
+    }
+  }
+
+  /** 从当前 context 收集最新 cookie（复用保存的身份 / bearer / 请求头）。 */
+  private async collectFromContext(saved: AuthRecord): Promise<void> {
+    const cookies = this.context ? await this.context.cookies() : [];
+    this.capturedAuth.cookies = cookies as unknown as CapturedAuth['cookies'];
+    this.capturedAuth.cookie_str = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
+    this.capturedAuth.bearer = saved.bearer;
+    this.capturedAuth.user_agent = this.capturedAuth.user_agent ?? saved.user_agent;
+    this.capturedAuth.extra_headers = this.capturedAuth.extra_headers ?? saved.extra_headers;
+    this.capturedAuth.account_info = saved.account_info;
+  }
 
   /**
    * 把引导横幅画到当前页面上（幂等；失败不影响主流程）。

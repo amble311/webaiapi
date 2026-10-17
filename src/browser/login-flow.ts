@@ -467,6 +467,8 @@ async function loginOnPlatform(ctx: {
      * 用户点「完成」才关窗（2026-10-16 用户要求）。
      * ⚠️ 因此本函数**每个早退分支都必须调 `capture.dispose()`**，否则会漏一个窗口。 */
     keepAlive: true,
+    /* 选中的是**已有账号** → 先用保存的凭证试登录（有效就跳过登录，失效才给登录页）。 */
+    reuseSavedCredential: Boolean(targetAccountId),
   });
 
   let captured: IdentityPrint;
