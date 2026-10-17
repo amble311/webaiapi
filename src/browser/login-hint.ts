@@ -23,8 +23,8 @@
  * 3. **动作白名单**：页面回传的动作只认 `done` / `reload` / `cancel`，
  *    其余一律忽略 —— 不给平台页面留下「往我们的进程里塞任意指令」的口子。
  */
-import { decodeJwt, type AuthRecord } from './credentials.js';
-import { extractAccountInfoSync } from './platforms.js';
+import type { AuthRecord } from './credentials.js';
+import { identityStrength } from './platforms.js';
 
 /** 横幅元素的 id（注入、更新、移除三处共用）。 */
 export const LOGIN_HINT_ELEMENT_ID = '__webaiapi_login_hint';
@@ -46,15 +46,21 @@ export const LOGIN_HINT_ELEMENT_ID = '__webaiapi_login_hint';
  */
 export const LOGIN_HINT_ACTION_ATTR = 'data-webaiapi-action';
 
-/** 横幅语气：`wait` 等登录中 / `done` 已检测到登录。 */
-export type LoginHintTone = 'wait' | 'done';
+/**
+ * 横幅语气：
+ * - `wait`     等登录中（三个按钮：我已登录继续 / 重开登录页 / 取消）
+ * - `done`     已检测到登录、正在保存（无按钮）
+ * - `captured` 凭证已落盘，**等用户点「完成」再关浏览器**（2026-10-16 用户要求：
+ *              好让他在客户端把模型参数设置好）
+ */
+export type LoginHintTone = 'wait' | 'done' | 'captured';
 
 /** 页面按钮能回传的动作（**白名单**）。 */
-export type LoginHintAction = 'done' | 'reload' | 'cancel';
+export type LoginHintAction = 'done' | 'reload' | 'cancel' | 'finish';
 
 /** 动作是否在白名单内（导出便于单测与 Node 侧共用同一份判据）。 */
 export function isLoginHintAction(value: unknown): value is LoginHintAction {
-  return value === 'done' || value === 'reload' || value === 'cancel';
+  return value === 'done' || value === 'reload' || value === 'cancel' || value === 'finish';
 }
 
 export interface LoginHintContent {
@@ -150,13 +156,22 @@ export function loginHintJs(content: LoginHintContent): string {
                 el.appendChild(tips);
             }
 
-            /* 检测到登录后不再给按钮（这时只需要等我们保存完） */
-            if (cfg.tone !== 'done') {
-                const actions = [
-                    { action: 'done', label: '✓ 我已登录，继续', primary: true },
-                    { action: 'reload', label: '↻ 重开登录页', primary: false },
-                    { action: 'cancel', label: '✕ 取消', primary: false },
-                ];
+            /* 按钮组按语气决定：
+             * - wait     ：让用户推动登录流程（也可回终端按回车）
+             * - done     ：正在保存，不需要按钮
+             * - captured ：凭证已落盘，只留「完成」——用户确认后在客户端设参数、
+             *              点它才关浏览器（2026-10-16 用户要求） */
+            const actions =
+                cfg.tone === 'captured'
+                    ? [{ action: 'finish', label: '✓ 完成（关闭浏览器）', primary: true }]
+                    : cfg.tone === 'done'
+                      ? []
+                      : [
+                            { action: 'done', label: '✓ 我已登录，继续', primary: true },
+                            { action: 'reload', label: '↻ 重开登录页', primary: false },
+                            { action: 'cancel', label: '✕ 取消', primary: false },
+                        ];
+            if (actions.length > 0) {
                 const row = document.createElement('div');
                 row.style.display = 'flex';
                 row.style.gap = '8px';
@@ -240,13 +255,13 @@ export function removeLoginHintJs(): string {
  * （游客是 32 位十六进制哈希，真实账号是用户名）。
  */
 export function isGuestCredential(platform: string, auth: AuthRecord): boolean {
-  if (platform !== 'chatglm') return false; // 其他平台暂时没有这个概念
-
-  const payload = decodeJwt(String(auth.bearer ?? ''));
-  if (Object.keys(payload).length === 0) return false; // 没 token：由 looksLoggedIn 判「未登录」
-
-  if (payload['is_guest'] === true) return true;
-  return /^[0-9a-f]{32}$/i.test(String(payload['sub'] ?? ''));
+  /* 委托给 `platforms.ts::identityStrength`（单一事实来源）：
+   * `session` 就是「只有匿名会话/设备 cookie」这一类 —— chatglm 的游客 JWT 也归在它里面。 */
+  try {
+    return identityStrength(platform, auth) === 'session';
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -262,21 +277,17 @@ export function isGuestCredential(platform: string, auth: AuthRecord): boolean {
  *    这正是 2026-10-16 那次「什么都没做就捕获成功」的原因。
  */
 export function looksLoggedIn(platform: string, auth: AuthRecord): boolean {
-  let info: Record<string, unknown>;
+  if (!platform) return false;
   try {
-    info = extractAccountInfoSync(platform, auth) as unknown as Record<string, unknown>;
+    /* ⚠️ 判据是**身份来源**，不是「有没有 identifier」（见 `IdentityStrength` 的说明）：
+     * deepseek 的游客也有 `ds_session_id` cookie，会被提取成 `session:<id>` 身份 ——
+     * 只看 identifier 就会「什么都没做也判定登录成功」，还多出一个账号文件
+     * （2026-10-16 实测：`session-<hash>.json` 就是这么来的）。 */
+    const strength = identityStrength(platform, auth);
+    return strength === 'user' || strength === 'token';
   } catch {
     return false;
   }
-
-  const identifier = String(info['identifier'] ?? '').trim();
-  if (!identifier || identifier === 'unknown') return false;
-
-  if (platform === 'chatglm') {
-    if (info['token_type'] !== 'jwt') return false;
-    return !isGuestCredential(platform, auth);
-  }
-  return true;
 }
 
 /**
@@ -293,6 +304,12 @@ export function loginHintContent(options: {
   /** 已知该平台已有账号时给出退出登录的提醒。 */
   warnExistingSession?: boolean;
   tone?: LoginHintTone;
+  /** `captured` 语气用：落盘的账号 id。 */
+  accountId?: string;
+  /** `captured` 语气用：账号身份（用户名/邮箱）。 */
+  identity?: string;
+  /** `captured` 语气用：建议客户端使用的模型名。 */
+  modelHint?: string;
 }): LoginHintContent {
   const { platformName, timeoutSeconds, warnExistingSession } = options;
 
@@ -301,6 +318,30 @@ export function loginHintContent(options: {
       tone: 'done',
       title: '✓ 已检测到登录，正在保存凭证…',
       tips: ['请不要关闭浏览器'],
+    };
+  }
+
+  if (options.tone === 'captured') {
+    /* 凭证已经落盘（`login-flow` 先 saveAs 再调这里），所以这时用户可以放心去
+     * 客户端配置；点「完成」我们才关浏览器 —— 之前是捕获完立刻关窗，
+     * 用户还没看清账号/身份就没了（2026-10-16 用户要求改）。
+     *
+     * ⚠️ 横幅里**不要写 markdown**（字面显示星号）。 */
+    const tips: string[] = [];
+    if (options.accountId) {
+      tips.push(
+        `会话账号：${options.accountId}` +
+          (options.identity ? `（身份 ${options.identity}）` : ''),
+      );
+    }
+    if (options.modelHint) {
+      tips.push(`在客户端里把模型名设为 ${options.modelHint}，其余参数按需设置`);
+    }
+    tips.push(`设置完成后点下面的「完成」我会关闭浏览器（也可在终端按一次回车）`);
+    return {
+      tone: 'captured',
+      title: `✓ ${platformName} 登录凭证已捕获并保存`,
+      tips,
     };
   }
 

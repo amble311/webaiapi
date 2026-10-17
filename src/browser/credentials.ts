@@ -14,7 +14,7 @@
  * （默认值就是 `~/.ai-api/auth`，所以实际行为一致，但配置项从此真的生效）。
  */
 import { createHash } from 'node:crypto';
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { expandHome, settings } from '../config.js';
@@ -90,6 +90,42 @@ export function authBaseDir(authDir?: string): string {
 /** 某账号的凭证文件路径（新格式 `{base}/{platform}/{account}.json`）。 */
 export function authFilePath(platform: string, accountId = 'default', authDir?: string): string {
   return join(authBaseDir(authDir), platform, `${accountId}.json`);
+}
+
+/**
+ * 只更新凭证里的 `bearer`（其余字段原样保留，原子写 + 0600）。
+ *
+ * ## ⚠️ 为什么需要（2026-10-16/17 实测）
+ * deepseek **会轮换 token**：`/api/v0/users/current` 的响应里就带 `biz_data.token`（新的）。
+ * 而网页端的登录态会因此**隔天失效** —— 实测现象：页面跳到 `/sign_in`、
+ * `localStorage.userToken` 被应用清成 `{"value":null}`，**但用旧 bearer 打 API 仍然 200**
+ * （说明是网页会话被作废，不是 token 过期）。
+ *
+ * 所以：每次拿到用户信息时把新 token 写回文件，凭证就能一直保持新鲜，
+ * 用户不用每天重登一次（provider 里由 `syncRefreshedToken()` 调用）。
+ *
+ * @returns 是否真的写入（内容没变 / 文件不存在 → false）
+ */
+export function updateAuthBearer(
+  platform: string,
+  accountId: string,
+  bearer: string,
+  authDir?: string,
+): boolean {
+  if (!bearer) return false;
+  try {
+    const file = authFilePath(platform, accountId, authDir);
+    if (!existsSync(file)) return false;
+    const auth = JSON.parse(readFileSync(file, 'utf8')) as AuthRecord;
+    if (String(auth.bearer ?? '') === bearer) return false;
+    auth.bearer = bearer;
+    const tmp = `${file}.tmp-${process.pid}`;
+    writeFileSync(tmp, JSON.stringify(auth, null, 2), { encoding: 'utf8', mode: 0o600 });
+    renameSync(tmp, file);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** 旧格式单文件路径（`{base}/{platform}.json`）。 */

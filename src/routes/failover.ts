@@ -102,7 +102,11 @@ export async function* streamWithFailover(
    * 拿不到独立通道时列表为空 → 完全保持原行为（回落主候选，串行）。 */
   const reqCtx = chatRequest.context ?? {};
   const wantAux = Boolean(reqCtx['use_aux_page']);
-  const auxCandidates = wantAux ? modelRouter.getAuxCandidates() : [];
+  /* 记录主通道平台，辅助通道据此**优先同平台**的另一账号（`mix` 不算平台）。 */
+  modelRouter.noteMainPlatform(model);
+  const auxCandidates = wantAux
+    ? modelRouter.getAuxCandidates(model === 'mix' ? undefined : model)
+    : [];
 
   logger.info(
     `[_stream_with_failover] 入口, model=${model}` +
@@ -224,12 +228,20 @@ export async function* streamWithFailover(
   );
 
   // 辅助任务优先走独立通道（另一个账号 + 独立页面 → 与主对话并行）
+  /* 辅助任务优先同平台（`getAuxCandidates` 已按「主通道平台优先」排序），
+   * 但**同平台没有副账号时允许用其它平台的独立通道**（2026-10-17 用户规则）：
+   * 「如果只有一个可用时，辅助模型可以尝试其他平台的」。
+   * ⚠️ 旧实现这里要求 `platformOf(候选) === platformOf(主)` → 跨平台候选被直接丢掉，
+   * 于是只能退回主 provider 串行执行（功能正常但慢），用户观感是"辅助通道没生效"。
+   * ⚠️ 若**所有平台所有账号只有一个可用**，`getAuxCandidates()` 返回空 → 自然回落到
+   * 主候选串行执行，也就是"辅助与主共用同一个账号"（用户规则第三条）。 */
   if (auxCandidates.length > 0) {
     const auxCandidate = auxCandidates[0];
-    if (auxCandidate && platformOf(auxCandidate[0]) === platformOf(platform)) {
+    if (auxCandidate) {
+      const samePlatform = platformOf(auxCandidate[0]) === platformOf(platform);
       logger.info(
-        `[_stream_with_failover] 辅助任务改用独立通道 ${auxCandidate[0]}` +
-          `（账号 ${auxCandidate[1].getAccountId()}）`,
+        `[_stream_with_failover] 辅助任务改用${samePlatform ? '同平台' : '其它平台'}独立通道 ` +
+          `${auxCandidate[0]}（账号 ${auxCandidate[1].getAccountId()}）`,
       );
       provider = auxCandidate[1];
     }

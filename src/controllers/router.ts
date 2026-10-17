@@ -36,8 +36,9 @@ import { PLATFORMS_WITH_PROVIDER } from '../browser/platforms.js';
 import { logger } from '../log/logger.js';
 import { getAvailableModelsList } from '../config.js';
 import { ChatGLMBrowserProvider } from '../providers/chatglm.js';
+import { DeepSeekBrowserProvider } from '../providers/deepseek.js';
 import { type BaseProvider } from '../providers/base.js';
-import { ModelNotFoundError } from '../utils/errors.js';
+import { ModelNotFoundError, PlatformUnavailableError } from '../utils/errors.js';
 
 /**
  * 平台名作为独立模型暴露给用户：调用 `model=<平台名>` 时只调度该平台的 Provider，
@@ -62,11 +63,31 @@ export const PLATFORM_MODEL_NAMES: readonly string[] = PLATFORMS_WITH_PROVIDER;
  * `channelKey` 非空时创建的是**辅助通道**实例（独立 context + 指定账号，见
  * `ChatGLMBrowserProvider` 的 `channelKey` 参数说明）。
  */
+/**
+ * 辅助通道候选的**平台优先顺序**：主通道所在平台排第一，其余按声明顺序兜底。
+ *
+ * 为什么要同平台优先（2026-10-16 用户要求）：用户在同一个平台登录了两个可用账号时
+ * （例如两个 deepseek），应当「一个当主账号、另一个当辅助账号」—— 不同账号、不同页面、
+ * 不同锁，可以真并行，也不必再依赖别的平台凑数。
+ *
+ * @param mainPlatform 主通道平台（未知 / `mix` 时传 `null`/`undefined`）
+ * @param auxPlatforms 已启用辅助通道的平台（声明顺序即兜底顺序）
+ */
+export function auxPlatformOrder(
+  mainPlatform: string | null | undefined,
+  auxPlatforms: readonly string[],
+): string[] {
+  const rest = auxPlatforms.filter((p) => p !== mainPlatform);
+  if (mainPlatform && auxPlatforms.includes(mainPlatform)) return [mainPlatform, ...rest];
+  return rest;
+}
+
 const PROVIDER_FACTORIES: Record<
   string,
   (accountId: string, channelKey?: string) => BaseProvider
 > = {
   chatglm: (accountId, channelKey) => new ChatGLMBrowserProvider({ accountId, channelKey }),
+  deepseek: (accountId, channelKey) => new DeepSeekBrowserProvider({ accountId, channelKey }),
 };
 
 /**
@@ -110,13 +131,40 @@ export class ModelRouter {
 
   private auxLastScan = 0;
 
+  /**
+   * 主通道最近一次使用的平台 —— 辅助通道候选据此**优先同平台**。
+   *
+   * 由 `streamWithFailover` 在每次请求入口调 {@link noteMainPlatform} 更新；
+   * 压缩 / 状态查询等拿不到请求平台的地方直接读它。
+   */
+  private lastMainPlatform: string | null = null;
+
+  /** 已启用辅助通道的平台（**只读**，供 `webaiapi model` 与文档展示）。 */
+  static auxChannelPlatforms(): readonly string[] {
+    return ModelRouter.AUX_CHANNEL_PLATFORMS;
+  }
+
+  /** 记录主通道平台（只有真实平台名才记，`mix` 不算）。 */
+  noteMainPlatform(platform: string | null | undefined): void {
+    if (platform && (PLATFORM_MODEL_NAMES as readonly string[]).includes(platform)) {
+      this.lastMainPlatform = platform;
+    }
+  }
+
   /* ---------------- 辅助通道常量 ---------------- */
 
   /**
    * 目前只有 ChatGLM 的 Provider 实现了「通道页面」（`channelKey`）。
    * 其他平台为什么没启用，见 {@link getAuxCandidates} 的说明。
    */
-  private static readonly AUX_CHANNEL_PLATFORMS: readonly string[] = ['chatglm'];
+  private static readonly AUX_CHANNEL_PLATFORMS: readonly string[] = [
+    'chatglm',
+    /* deepseek：**前向声明** —— 它的 provider 还没实现（`providerImplemented: false`），
+     * 循环里 `this.providers.get('deepseek')` 拿不到实例会自动跳过，所以现在写进来是安全的。
+     * provider 支持 `channelKey`（独立 context 页面）后，用户登录两个 deepseek 账号即自动
+     * 「一个主、一个辅」（2026-10-16 用户要求）。 */
+    'deepseek',
+  ];
 
   /** 运行中惰性重扫辅助通道的最小间隔（秒）：登录完第二个账号后**免重启**。 */
   private static readonly AUX_RESCAN_INTERVAL = 30;
@@ -159,15 +207,32 @@ export class ModelRouter {
     if (usable.length === 1) return first as string;
 
     const picked = usable[Math.floor(Math.random() * usable.length)] as string;
-    logger.info(`[main] 随机分配主通道账号: ${picked}（候选 ${usable.join(',')}）`);
+    logger.info(`[main] ${platform} 随机分配主通道账号: ${picked}（候选 ${usable.join(',')}）`);
     return picked;
   }
 
-  /** 注册所有 Browser Provider。 */
+  /**
+   * 注册**所有**实现了 Provider 的平台。
+   *
+   * ⚠️⚠️ 2026-10-16 实测 bug：这里原来**写死只注册 chatglm**
+   * （`new ChatGLMBrowserProvider(...)` 一行）。于是 deepseek 的 provider、
+   * 工厂表 `PROVIDER_FACTORIES.deepseek`、`providerImplemented: true` 三样都齐了，
+   * 却**永远不会被注册** → 客户端请求 `model=deepseek` 得到
+   * 「模型 'deepseek' 不存在或不可用」（用户实测报上来）。
+   * `PLATFORM_MODEL_NAMES`（= `PLATFORMS_WITH_PROVIDER`）是**唯一事实来源**，必须遍历它。
+   */
   private registerProviders(): void {
-    // 主通道账号**随机**分配（另一个账号自动成为辅助通道，见 setupAuxChannels）
-    const accountId = ModelRouter.pickRandomMainAccount('chatglm');
-    this.registerProvider('chatglm', new ChatGLMBrowserProvider({ accountId }));
+    for (const platform of PLATFORM_MODEL_NAMES) {
+      const factory = PROVIDER_FACTORIES[platform];
+      if (!factory) {
+        // 单测核对了「声明 ⟷ 工厂」一致，这里是运行时的最后一道防线
+        logger.warn(`[main] 平台 ${platform} 声明了 providerImplemented 但没有工厂，跳过`);
+        continue;
+      }
+      // 主通道账号**随机**分配（另一个账号自动成为辅助通道，见 setupAuxChannels）
+      const accountId = ModelRouter.pickRandomMainAccount(platform);
+      this.registerProvider(platform, factory(accountId));
+    }
     logger.info(`已注册 ${this.providers.size} 个 Browser Provider`);
   }
 
@@ -316,9 +381,16 @@ export class ModelRouter {
    *
    * @returns 三元组列表；空列表表示没有独立通道可用，调用方应回落主候选。
    */
-  getAuxCandidates(): MixCandidate[] {
-    const platform = ModelRouter.AUX_CHANNEL_PLATFORMS[0] as string;
+  getAuxCandidates(mainPlatform?: string): MixCandidate[] {
     const now = Date.now() / 1000;
+    /* ⚠️ 2026-10-16 改：原来写死 `AUX_CHANNEL_PLATFORMS[0]`（chatglm）——
+     * 主通道是 deepseek 且用户登录了两个 deepseek 账号时，辅助通道**永远不会**用同平台
+     * 的第二个账号（会去 chatglm 找，找不到就串行）。现在改为「**主通道所在平台优先**」：
+     * 同平台没有副账号时才退到其它已启用辅助通道的平台（用户要求）。 */
+    const preferred = mainPlatform ?? this.lastMainPlatform ?? undefined;
+    const order = auxPlatformOrder(preferred, ModelRouter.AUX_CHANNEL_PLATFORMS);
+
+    for (const platform of order) {
 
     if (!this.auxProviders.has(platform)) {
       // 惰性重扫：用户刚登录完第二个账号时**不需要重启服务**
@@ -364,9 +436,16 @@ export class ModelRouter {
       }
     }
 
-    const provider = this.auxProviders.get(platform);
-    if (!provider) return [];
-    return [[platform, provider, 1]];
+      const provider = this.auxProviders.get(platform);
+      if (provider) {
+        if (preferred && platform !== preferred) {
+          logger.info(`[aux] 同平台（${preferred}）没有可用副账号 → 改用 ${platform} 的辅助通道`);
+        }
+        return [[platform, provider, 1]];
+      }
+    }
+
+    return [];
   }
 
   /**
@@ -448,10 +527,17 @@ export class ModelRouter {
       try {
         const usable = await provider.checkLoginStatus();
         if (!usable) {
-          throw new ModelNotFoundError(model);
+          /* ⚠️ 用户规则（2026-10-17）：「用户指定模型类型时，如果该平台没有一个连接成功的，
+           * 则返回错误提醒并停止对话」—— 这里**必须报明确错误**（不再笼统说「模型不存在」），
+           * 也**不做跨平台故障转移**（指定了平台就只走这个平台）。 */
+          throw new PlatformUnavailableError(
+            model,
+            `当前没有任何可用账号（连接失败）。请用 webaiapi accounts 查看，` +
+              `或重跑 webaiapi login ${model} 刷新凭证`,
+          );
         }
       } catch (error) {
-        if (error instanceof ModelNotFoundError) throw error;
+        if (error instanceof ModelNotFoundError || error instanceof PlatformUnavailableError) throw error;
         logger.warn(`检查 ${model} 登录状态失败: ${String(error)}`);
       }
 
@@ -471,10 +557,14 @@ export class ModelRouter {
     try {
       const usable = await provider.checkLoginStatus();
       if (!usable) {
-        throw new ModelNotFoundError(model);
+        throw new PlatformUnavailableError(
+          providerName,
+          `当前没有任何可用账号（连接失败）。请用 webaiapi accounts 查看，` +
+            `或重跑 webaiapi login ${providerName} 刷新凭证`,
+        );
       }
     } catch (error) {
-      if (error instanceof ModelNotFoundError) throw error;
+      if (error instanceof ModelNotFoundError || error instanceof PlatformUnavailableError) throw error;
       logger.warn(`检查 ${model} 登录状态失败: ${String(error)}`);
     }
 

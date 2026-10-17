@@ -128,11 +128,75 @@ function extractKimi(auth: AuthRecord): AccountInfo {
   return info;
 }
 
-/** DeepSeek：优先 `ds_session_id` cookie，退回 bearer 前缀。 */
+/**
+ * DeepSeek 的 `GET /api/v0/users/current` 响应 → 账号身份（**纯函数**）。
+ *
+ * 实测响应形状（2026-10-16 用真实凭证打出来的）：
+ * ```
+ * { code:0, data:{ biz_code:0, biz_data:{
+ *     id:"c4aacdd2-414c-4d45-bd55-f19028d8627c",     ← 稳定用户 id（跨登录不变）
+ *     email:"71*****23@qq.com", mobile_number:"136******18",
+ *     id_profile:{ provider, id, name:"徐崇夏", picture, locale, email } } } }
+ * ```
+ *
+ * ⚠️ `identifier` 取 `biz_data.id`（**稳定**），不要用 `ds_session_id` cookie —— 那个每次登录
+ * 都会换，拿它当身份会让「同一个人」被当成两个账号（辅助通道/去重判断全失效）。
+ */
+export function parseDeepseekUserInfo(data: unknown): AccountInfo {
+  const info: AccountInfo = {};
+  if (!data || typeof data !== 'object') return info;
+
+  const outer = (data as Record<string, unknown>)['data'];
+  const biz = (outer && typeof outer === 'object' ? (outer as Record<string, unknown>)['biz_data'] : null) as
+    | Record<string, unknown>
+    | null
+    | undefined;
+  if (!biz || typeof biz !== 'object') return info;
+
+  const profile = (biz['id_profile'] ?? {}) as Record<string, unknown>;
+  const email = str(biz['email']);
+  const phone = str(biz['mobile_number']) || str(biz['phone']);
+  const name = str(profile['name']) || str(biz['name']);
+  const userId = str(biz['id']) || str(profile['id']);
+
+  if (email) info['email'] = email;
+  if (phone) info['phone'] = phone;
+  if (name) info['name'] = name;
+  if (userId) {
+    info['user_id'] = userId;
+    // ⚠️ 稳定身份：session cookie 每次都变，用户 id 不变
+    info['identifier'] = userId;
+  }
+  // 标签优先级：name（真实名字）> email > phone
+  if (name) info['label'] = name;
+  else if (email) info['label'] = email;
+  else if (phone) info['label'] = phone;
+
+  return info;
+}
+
+/**
+ * DeepSeek：**优先用已落盘的 API 身份**（`user_id`/`name`），再退回 cookie/bearer。
+ *
+ * ⚠️ 顺序很重要（2026-10-16 实测）：`ds_session_id` 每次登录都换 → 拿它当身份会让
+ * 「同一个人」被当成两个账号（去重、辅助通道、`/v1/status` 全看这个身份）。
+ * 而 API 身份是在**登录捕获时**写进凭证文件的（`account_info`），所以这里先读它。
+ */
 function extractDeepseek(auth: AuthRecord): AccountInfo {
   const info: AccountInfo = {};
-  const bearer = str(auth.bearer);
+  const persisted = (auth.account_info ?? {}) as AccountInfo;
 
+  const persistedId = str(persisted['user_id']) || str(persisted['identifier']);
+  if (persistedId && persistedId !== 'unknown' && !persistedId.startsWith('session:')) {
+    info['identifier'] = persistedId;
+    const label = str(persisted['label']);
+    if (label) info['label'] = label;
+    if (persisted['name']) info['name'] = persisted['name'];
+    if (persisted['email']) info['email'] = persisted['email'];
+    return info;
+  }
+
+  const bearer = str(auth.bearer);
   const sessionId = getCookieValue(auth.cookies, 'ds_session_id');
   if (sessionId) {
     info['identifier'] = sessionId;
@@ -216,6 +280,70 @@ function extractGeneric(auth: AuthRecord): AccountInfo {
 }
 
 /* ------------------------------------------------------------------ */
+/* 身份可靠度（决定「算不算登录成功」「能不能落盘」）                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 身份可靠度 —— 两件事都由它决定：**这算不算「登录完成」**、**能不能落盘**。
+ *
+ * ## ⚠️ 为什么要这个（2026-10-16 两起实测事故）
+ * - **chatglm**：给**任何访客**都发匿名 JWT（`is_guest: true`）→ 用户什么都没做就被判定
+ *   登录成功，还把真实账号的凭证覆盖成游客凭证（靠 `.bak` 才救回）；
+ * - **deepseek**：游客也有 `ds_session_id` cookie，而 {@link extractDeepseek} 优先拿它当身份
+ *   → 同样「什么都没做就成功」，还**多出一个账号文件**（`session-<hash>.json`）。
+ *   实测对比：真实账号的凭证里有 **64 字符 bearer**（身份「徐崇夏」，5 个 cookie），
+ *   游客只有 3 个 cookie、没有任何 bearer。
+ *
+ * 所以判据不能是「有 identifier 就算人」，必须区分**身份来源**：
+ *
+ * | 取值 | 含义 | 算登录成功？ | 允许落盘？ |
+ * |---|---|---|---|
+ * | `user` | 平台侧确认到真实用户（JWT 里的用户名/uid，或真实 bearer） | ✅ | ✅ |
+ * | `token` | 只拿到一个无法确认用户的 token（未知平台兜底） | ✅ | ✅ |
+ * | `session` | **只有匿名会话 / 设备 cookie**（游客） | ❌ | ❌ |
+ * | `unknown` | 什么都没有 | ❌ | ❌ |
+ */
+export type IdentityStrength = 'user' | 'token' | 'session' | 'unknown';
+
+/** 见 {@link IdentityStrength} 的说明。 */
+export function identityStrength(platform: string, auth: AuthRecord): IdentityStrength {
+  const info = extractAccountInfoSync(platform, auth);
+  const label = str(info['label']);
+  const identifier = str(info['identifier']);
+  const bearer = str(auth.bearer);
+
+  if (platform === 'chatglm') {
+    // 游客 JWT 与真实 JWT 都来自 authorization 头，靠载荷里的 `is_guest` 区分（实测字段：
+    // 游客 true、真实账号该字段不存在）—— `AccountInfo` 里没有这个字段，必须解 JWT。
+    const payload = decodeJwt(bearer);
+    if (Object.keys(payload).length > 0) {
+      if (payload['is_guest'] === true) return 'session';
+      /* 老 token 没有 `is_guest` 字段：真实账号的 `sub` 是用户名（实测「洛小北」「用户_bFa15b」），
+       * 游客是 32 位十六进制哈希（实测「0d808cbb…」）→ 按形状兜底。 */
+      return /^[0-9a-f]{32}$/i.test(str(payload['sub'])) ? 'session' : 'user';
+    }
+    // 只有 chatglm_user_id cookie（游客也有）→ 匿名会话
+    return identifier && identifier !== 'unknown' ? 'session' : 'unknown';
+  }
+
+  if (platform === 'deepseek') {
+    // 真实登录后请求里才带 authorization（实测真身是 64 字符 bearer）
+    if (bearer) return 'user';
+    return getCookieValue(auth.cookies, 'ds_session_id') ? 'session' : 'unknown';
+  }
+
+  /* 通用兜底：
+   * 1. 身份标签里的「前缀」含 session（`session:<id>` / `<cookieName>:…`，如 deepseek 的
+   *    `session:…`、豆包的 `doubao_session:…`）= cookie 扫描出的**匿名会话 id**
+   *    → 一律按游客处理（2026-10-16 造出垃圾账号的就是这一类）；
+   * 2. 其余有身份的当 `token`：我们无法确认用户，但流程下一步会让用户核对身份。 */
+  const labelHead = label.split(':')[0] ?? '';
+  if (/session/i.test(labelHead)) return 'session';
+  if (identifier && identifier !== 'unknown') return 'token';
+  return 'unknown';
+}
+
+/* ------------------------------------------------------------------ */
 /* 注册表                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -248,7 +376,7 @@ export const PLATFORM_LIST: readonly PlatformSpec[] = [
       authHeader: 'authorization',
       authPrefix: 'Bearer ',
     },
-    providerImplemented: false,
+    providerImplemented: true,
     extractIdentity: extractDeepseek,
   },
   {

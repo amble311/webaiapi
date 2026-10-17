@@ -1180,9 +1180,17 @@ export async function parseAndRecoverToolCalls(params: {
    * - **全是只读操作**（read_file / list_dir / search_content …）→ 全部下发，
    *   客户端会并行执行。这类调用不改变任何状态，不存在互相影响；
    *   实测模型一次就想读 4 个文件，若只发第一个，24 轮上限几下就被耗光。
-   * - 只要包含**写/改/执行**类 → 仍然只发第一个：
-   *   同一回复里第二个 SearchReplace 的 `old_str` 可能因为第一个的修改而不再匹配，
-   *   必须让 AI 看到第一个的结果后再生成第二个。 */
+   * - **含写/改/执行类** → 下发**到「第一个写操作」为止**（它之前的只读调用照旧一起下发），
+   *   之后的丢弃。
+   *
+   * ⚠️⚠️ 2026-10-16 实测修正（原来是「只要含写操作就**只发第一个**」）：
+   * 模型一次规划了 8 个调用 —— `search_content×4, read_file×2, execute_command×2` ——
+   * 旧策略砍成**只剩 1 个**，其余 7 个（含 4 次读）**凭空消失且模型不知道** →
+   * 它以为信息不全 → 重新读一遍……实测连续 **8 轮只读不写**（用户报「模型不肯动手」）。
+   * 新策略下这一轮会下发 7 个（只丢弃最后一个重复的写），模型仍能拿到想读的内容。
+   *
+   * 保留「丢弃第一个写操作之后的调用」这个取舍：写操作会让后面调用的
+   * `old_str` / 行号 / 内容失效，必须让模型看到写的结果后再生成。 */
   if (parsedToolCalls.length > 1) {
     const names = parsedToolCalls.map((tc) => tc.function.name);
     if (names.every((n) => isReadOnlyTool(n))) {
@@ -1191,11 +1199,15 @@ export async function parseAndRecoverToolCalls(params: {
           '全部下发（客户端并行执行）',
       );
     } else {
+      const firstWrite = names.findIndex((n) => !isReadOnlyTool(n));
+      const keep = firstWrite >= 0 ? firstWrite + 1 : names.length;
+      const dropped = names.slice(keep);
       logger.info(
         `[tool_calls] 有 ${parsedToolCalls.length} 个工具调用（含写操作，names=${names.join(', ')}），` +
-          `只发第一个 (${names[0]})，其余丢弃`,
+          `下发到第一个写操作为止共 ${keep} 个（${names.slice(0, keep).join(', ')}）` +
+          `，丢弃 ${dropped.length} 个${dropped.length > 0 ? `（${dropped.join(', ')}）` : ''}`,
       );
-      parsedToolCalls = parsedToolCalls.slice(0, 1);
+      parsedToolCalls = parsedToolCalls.slice(0, keep);
     }
   }
 

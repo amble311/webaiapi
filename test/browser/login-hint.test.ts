@@ -48,6 +48,15 @@ describe('looksLoggedIn —— 「登录是否完成」的判据', () => {
     expect(looksLoggedIn('chatglm', {})).toBe(false);
   });
 
+  it('⭐ deepseek：只有 ds_session_id（游客会话）→ **不算登录**（2026-10-16 多出账号的 bug）', () => {
+    // 实测：游客也有这个 cookie，旧判据只看 identifier 就判定成功
+    expect(
+      looksLoggedIn('deepseek', {
+        cookies: [{ name: 'ds_session_id', value: '9f694f1700cc4689bae6f020bf2d3428' }] as never,
+      }),
+    ).toBe(false);
+  });
+
   it('其他平台：拿到 bearer 就算（identify 走 bearer 前缀）', () => {
     expect(looksLoggedIn('deepseek', { bearer: 'abc123def456ghi789' })).toBe(true);
     expect(looksLoggedIn('deepseek', {})).toBe(false);
@@ -133,6 +142,41 @@ describe('loginHintContent —— 文案', () => {
 
     expect([withWarn.title, ...withWarn.tips].join()).toContain('退出登录');
     expect([without.title, ...without.tips].join()).not.toContain('退出登录');
+  });
+
+  it('⭐ captured 语气：凭证已保存 + 账号/身份 + 提示设好模型参数再点「完成」', () => {
+    const content = loginHintContent({
+      platformName: 'DeepSeek',
+      elapsedSeconds: 0,
+      timeoutSeconds: 600,
+      tone: 'captured',
+      accountId: '251bd0bf6bb84fe8b61a9aacb8207ca4',
+      identity: '徐崇夏',
+      modelHint: 'deepseek',
+    });
+    const all = [content.title, ...content.tips].join('\n');
+
+    expect(content.tone).toBe('captured');
+    expect(all).toContain('已捕获并保存');
+    expect(all).toContain('251bd0bf6bb84fe8b61a9aacb8207ca4');
+    expect(all).toContain('徐崇夏');
+    // 用户原话：「请设置好模型参数后点击完成」
+    expect(all).toContain('模型名设为 deepseek');
+    expect(all).toContain('点下面的「完成」');
+    // 横幅里不许出现 markdown（会字面显示星号）
+    expect(all).not.toContain('**');
+  });
+
+  it('captured 语气：缺账号/身份信息时也不出错', () => {
+    const content = loginHintContent({
+      platformName: 'DeepSeek',
+      elapsedSeconds: 0,
+      timeoutSeconds: 600,
+      tone: 'captured',
+    });
+    expect(content.tone).toBe('captured');
+    expect(content.tips.length).toBeGreaterThan(0);
+    expect(content.tips.join()).not.toContain('undefined');
   });
 
   it('检测到登录后：改成绿色「正在保存凭证」，并提示别关浏览器', () => {
@@ -233,8 +277,14 @@ describe('页面按钮', () => {
     expect(js).toContain('window.top !== window.self');
   });
 
-  it('检测到登录后不再渲染按钮（此时只需等保存完成）', () => {
-    expect(js).toContain("cfg.tone !== 'done'");
+  it('⭐ 按语气给不同按钮组：captured 只留「完成」，done 不给按钮', () => {
+    // captured = 凭证已落盘、等用户点「完成」再关浏览器（2026-10-16 用户要求）
+    expect(js).toContain("cfg.tone === 'captured'");
+    expect(js).toContain('✓ 完成（关闭浏览器）');
+    // done = 正在保存，不需要按钮
+    expect(js).toContain("cfg.tone === 'done'");
+    // 三个 wait 按钮仍在（wait 语气用）
+    expect(js).toContain('✓ 我已登录，继续');
   });
 
   it('按钮点完就置灰（防连点）', () => {
@@ -242,10 +292,12 @@ describe('页面按钮', () => {
     expect(js).toContain('处理中');
   });
 
-  it('⭐ 动作白名单：只认 done/reload/cancel', () => {
+  it('⭐ 动作白名单：只认 done/reload/cancel/finish', () => {
     expect(isLoginHintAction('done')).toBe(true);
     expect(isLoginHintAction('reload')).toBe(true);
     expect(isLoginHintAction('cancel')).toBe(true);
+    // captured 语气的「完成」按钮（用户点它才关浏览器）
+    expect(isLoginHintAction('finish')).toBe(true);
     // 其余一律拒绝 —— 平台页面上那个全局函数不能被当成任意指令通道
     expect(isLoginHintAction('rm')).toBe(false);
     expect(isLoginHintAction('')).toBe(false);

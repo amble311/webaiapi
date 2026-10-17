@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   type AuthRecord,
   type CapturedCookie,
+  authFilePath,
   cookieFingerprint,
   decodeJwt,
   getCookieValue,
@@ -14,6 +15,7 @@ import {
   listAccounts,
   loadAuth,
   normalizeCookies,
+  updateAuthBearer,
 } from '../../src/browser/credentials.js';
 import { extractAccountInfoSync } from '../../src/browser/platforms.js';
 
@@ -322,5 +324,59 @@ describe('normalizeCookies', () => {
   it('空输入返回空数组', () => {
     expect(normalizeCookies(undefined)).toEqual([]);
     expect(normalizeCookies([])).toEqual([]);
+  });
+});
+
+/**
+ * ⭐ `updateAuthBearer` —— 2026-10-17 实测需求（deepseek token 轮换导致网页登录态隔天失效）。
+ *
+ * 现象：页面跳 `/sign_in`、`localStorage.userToken` 被清成 `{"value":null}`，
+ * 但**用旧 bearer 打 API 仍然 200** —— 是网页会话被作废，不是 token 过期。
+ * 对策：每次拿到用户信息就把新 token 写回凭证（provider 的 `syncRefreshedToken()`）。
+ */
+describe('updateAuthBearer', () => {
+  const seed = (accountId: string, record: Record<string, unknown>): string => {
+    const file = authFilePath('deepseek', accountId, dir);
+    mkdirSync(join(dir, 'deepseek'), { recursive: true });
+    writeFileSync(file, JSON.stringify(record, null, 2), 'utf8');
+    return file;
+  };
+
+  it('⭐ 换掉旧 bearer，且其它字段一个都不丢', () => {
+    seed('acc1', {
+      bearer: 'OLD_TOKEN',
+      cookies: [{ name: 'ds_session_id', value: 'x' }],
+      account_info: { label: '洛小北', identifier: 'u1' },
+      captured_at: 123,
+    });
+
+    expect(updateAuthBearer('deepseek', 'acc1', 'NEW_TOKEN', dir)).toBe(true);
+
+    const after = loadAuth('deepseek', { accountId: 'acc1', authDir: dir });
+    expect(after?.bearer).toBe('NEW_TOKEN');
+    expect(after?.account_info?.label).toBe('洛小北');
+    expect((after?.cookies ?? []).length).toBe(1);
+    expect(after?.captured_at).toBe(123);
+  });
+
+  it('内容没变 / 文件不存在 / bearer 为空 → false，不抛', () => {
+    seed('acc2', { bearer: 'SAME' });
+    expect(updateAuthBearer('deepseek', 'acc2', 'SAME', dir)).toBe(false);
+    expect(updateAuthBearer('deepseek', 'missing', 'X', dir)).toBe(false);
+    expect(updateAuthBearer('deepseek', 'acc2', '', dir)).toBe(false);
+  });
+
+  it('写入后权限 0600（凭证是敏感信息）', () => {
+    const file = seed('acc3', { bearer: 'A' });
+    expect(updateAuthBearer('deepseek', 'acc3', 'B', dir)).toBe(true);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+  });
+
+  it('坏 JSON → false，且原文件不被破坏', () => {
+    const file = authFilePath('deepseek', 'bad', dir);
+    mkdirSync(join(dir, 'deepseek'), { recursive: true });
+    writeFileSync(file, '{not json', 'utf8');
+    expect(updateAuthBearer('deepseek', 'bad', 'X', dir)).toBe(false);
+    expect(readFileSync(file, 'utf8')).toBe('{not json');
   });
 });

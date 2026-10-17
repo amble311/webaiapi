@@ -23,10 +23,12 @@ import { copyFileSync, existsSync, mkdirSync, renameSync, writeFileSync, chmodSy
 import { firefox, type Browser, type BrowserContext, type Page, type Request } from 'playwright';
 
 import { logger } from '../log/logger.js';
+import { parseDeepseekUserInfo, platformDisplayName } from './platforms.js';
 import { STEALTH_JS } from './stealth.js';
 import { isInteractive } from '../utils/prompt.js';
 import { evaluateFn, iife } from './js-eval.js';
 import {
+  type LoginHintAction,
   isLoginHintAction,
   loginHintContent,
   loginHintJs,
@@ -61,6 +63,14 @@ export class LoginCancelledError extends Error {
   }
 }
 
+/**
+ * 「完成」闸门的默认等待上限（秒）。
+ *
+ * 用户要在这段时间里去客户端把模型参数设置好 —— 给足 10 分钟；
+ * 超时也会自动关浏览器（不能把窗口无限留在那里）。
+ */
+const FINISH_GATE_TIMEOUT_SECONDS = 600;
+
 /** 仅所有者可读写（凭证是敏感信息，与 Python 的 chmod 0o600 一致）。 */
 const AUTH_FILE_MODE = 0o600;
 
@@ -88,7 +98,17 @@ export interface CapturedAuth extends AuthRecord {
  * ⚠️ `platform === 'chatglm'` **直接短路**：它的 JWT 里已经含用户名，
  * 而调它的 user info API 需要 `x-sign` 签名（我们没有）。
  */
-export async function fetchAccountInfo(platform: string, auth: AuthRecord): Promise<AccountInfo> {
+export async function fetchAccountInfo(
+  platform: string,
+  auth: AuthRecord,
+  /**
+   * 当前页面（可选）。给了就**先在页面里调**这个 API：
+   * 页面带着浏览器自己的 cookie、TLS 指纹与 WAF 会话（`HWWAFSESID`），
+   * 比 Node 直连稳（2026-10-16：Node 直连偶发失败且只打 debug 日志，导致
+   * 登录后身份停在 `session:<ds_session_id>`、拿不到用户名）。
+   */
+  page?: Page | null,
+): Promise<AccountInfo> {
   const info = extractAccountInfoSync(platform, auth);
 
   // chatglm 无需（也不该）再调 API
@@ -124,34 +144,75 @@ export async function fetchAccountInfo(platform: string, auth: AuthRecord): Prom
 
   if (!apiUrl) return info;
 
+  /* ① **先在页面里调**（2026-10-16 加）：浏览器带着自己的 cookie、TLS 指纹与 WAF 会话，
+   *    比 Node 直连稳得多。⚠️ `Cookie` / `User-Agent` 是浏览器**禁止脚本设置**的头，
+   *    必须剔掉（页面自己会带）。 */
+  if (page) {
+    const pageHeaders: Record<string, string> = { Accept: 'application/json' };
+    if (headers['Authorization']) pageHeaders['Authorization'] = headers['Authorization'];
+    for (const [k, v] of Object.entries(headers)) {
+      const lower = k.toLowerCase();
+      if (['cookie', 'user-agent', 'accept', 'content-length', 'host', 'connection'].includes(lower)) continue;
+      pageHeaders[k] = v;
+    }
+    try {
+      const inPage = await evaluateFn<unknown>(
+        page,
+        `async () => {
+    try {
+      const r = await fetch(${JSON.stringify(apiUrl)}, {
+        headers: ${JSON.stringify(pageHeaders)},
+        credentials: 'include',
+        cache: 'no-store',
+      });
+      if (!r.ok) return { __waiapi_status: r.status };
+      return await r.json();
+    } catch (e) {
+      return { __waiapi_error: String(e) };
+    }
+  }`,
+      );
+      const rec = (inPage ?? {}) as Record<string, unknown>;
+      if (rec['__waiapi_status']) {
+        logger.warn(
+          `[${platform}] 页面内取用户信息失败（HTTP ${String(rec['__waiapi_status'])}）→ 改走 Node 直连`,
+        );
+      } else if (rec['__waiapi_error']) {
+        logger.warn(
+          `[${platform}] 页面内取用户信息异常（${String(rec['__waiapi_error'])}）→ 改走 Node 直连`,
+        );
+      } else if (rec['code'] !== undefined) {
+        const parsed = platform === 'deepseek' ? parseDeepseekUserInfo(rec) : {};
+        if (parsed['label']) {
+          logger.info(`[${platform}] 页面内取到用户信息: ${String(parsed['label'])}`);
+          return { ...info, ...parsed };
+        }
+        logger.warn(`[${platform}] 页面内调用成功但没解析出身份（shape 可能变了）`);
+      }
+    } catch (error) {
+      logger.warn(`[${platform}] 页面内取用户信息失败（${String(error)}）→ 改走 Node 直连`);
+    }
+  }
+
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 15_000);
     try {
       const resp = await fetch(apiUrl, { headers, signal: controller.signal });
       if (!resp.ok) {
-        logger.debug(`[${platform}] user info API 返回 ${resp.status}`);
+        // ⚠️ 这里原来是 debug —— 失败后身份会停在 `session:<ds_session_id>`（每次都变），
+        //    用户看到的就是「登录成功了但没拿到用户名」。提到 warn 才能被发现。
+        logger.warn(
+          `[${platform}] user info API 返回 ${resp.status}（拿不到用户名，身份退回 cookie/前缀）`,
+        );
         return info;
       }
       const data = (await resp.json()) as Record<string, unknown>;
       logger.info(`[${platform}] 获取到 user info: ${JSON.stringify(data).slice(0, 200)}`);
 
       if (platform === 'deepseek') {
-        const outer = (data['data'] ?? {}) as Record<string, unknown>;
-        const biz = (outer['biz_data'] ?? {}) as Record<string, unknown>;
-        const profile = (biz['id_profile'] ?? {}) as Record<string, unknown>;
-        const email = biz['email'] ? String(biz['email']) : '';
-        const phone = biz['mobile_number'] ?? biz['phone'];
-        const name = profile['name'] ?? biz['name'];
-
-        if (email) info['email'] = email;
-        if (name) info['name'] = String(name);
-        if (phone) info['phone'] = String(phone);
-        if (biz['id']) info['user_id'] = String(biz['id']);
-        // 标签优先级：name（真实名字）> email > phone
-        if (name) info['label'] = String(name);
-        else if (email) info['label'] = email;
-        else if (phone) info['label'] = String(phone);
+        // 解析逻辑抽成纯函数（可单测），并**用 user id 当稳定身份**而不是 session cookie
+        Object.assign(info, parseDeepseekUserInfo(data));
       } else if (platform === 'kimi') {
         // 匿名用户 name 通常是「虚拟用户」，不应作为标识
         const isAnon = Boolean(data['is_anonymous']);
@@ -171,7 +232,7 @@ export async function fetchAccountInfo(platform: string, auth: AuthRecord): Prom
       clearTimeout(timer);
     }
   } catch (error) {
-    logger.debug(`[${platform}] 获取 user info 失败（不影响主流程）: ${String(error)}`);
+    logger.warn(`[${platform}] 获取 user info 失败（不影响主流程，但身份会退回 cookie/前缀）: ${String(error)}`);
   }
 
   return info;
@@ -203,6 +264,13 @@ export interface AuthCaptureOptions {
    * 一个「看起来像账号文件」的残骸（`listAccounts` 跳过它，但人肉 ls 会看到）。
    */
   saveOnCapture?: boolean;
+  /**
+   * 捕获成功后是否**保持浏览器打开**，等调用方显式调用 {@link AuthCapture.finish}
+   * 或 {@link AuthCapture.dispose} 再关（默认 `false` = 老行为：立刻关）。
+   *
+   * 只有「成功捕获」才会保持；失败/取消仍然立刻关闭。
+   */
+  keepAlive?: boolean;
 }
 
 export class AuthCapture {
@@ -234,7 +302,19 @@ export class AuthCapture {
   readonly capturedAuth: CapturedAuth = {};
 
   /** 页面按钮最近回传的动作（刷新循环从 DOM 属性读到后写入，由等待循环处理）。 */
-  private pendingAction: 'done' | 'reload' | 'cancel' | null = null;
+  private pendingAction: LoginHintAction | null = null;
+
+  /**
+   * 捕获成功后**是否保持浏览器打开**（等用户点「完成」）。
+   *
+   * `login-flow` 传 `true`：它要先落盘、打印账号/身份，再让用户在客户端把模型参数
+   * 设置好、点「完成」才关浏览器（2026-10-16 用户要求；之前是捕获完立刻关窗，
+   * 用户还没看清账号就没了）。**非成功路径仍会关**，见 `keepAliveArmed`。
+   */
+  private readonly keepAlive: boolean;
+
+  /** 只有**成功捕获**后才置位 —— 失败/取消路径照样关掉浏览器（不留孤儿窗口）。 */
+  private keepAliveArmed = false;
 
   constructor(platform: string, options: AuthCaptureOptions = {}) {
     this.platform = platform;
@@ -243,6 +323,7 @@ export class AuthCapture {
     this._accountId = options.accountId ?? 'default';
     this.headless = options.headless ?? false;
     this.captureTimeout = options.captureTimeout ?? 600;
+    this.keepAlive = options.keepAlive === true;
 
     this.authDir = authBaseDir(options.authDir);
     mkdirSync(this.authDir, { recursive: true });
@@ -375,7 +456,7 @@ export class AuthCapture {
 
       // 提取账号身份（chatglm 走同步提取，其他平台会调 API）
       try {
-        const accountInfo = await fetchAccountInfo(this.platform, this.capturedAuth);
+        const accountInfo = await fetchAccountInfo(this.platform, this.capturedAuth, this.page);
         this.capturedAuth.account_info = accountInfo;
         if (accountInfo.label) logger.info(`✓ 账号身份: ${accountInfo.label}`);
       } catch (error) {
@@ -383,10 +464,18 @@ export class AuthCapture {
       }
 
       if (this.saveOnCapture) this.saveAuth();
-      await this.dropLoginHint();
+      if (this.keepAlive) {
+        /* 交给调用方决定何时关（它会先落盘 + 打印账号，再调 finish()）。
+         * 光标位置保持在页面上那条绿色横幅，告诉用户「别关窗」。 */
+        this.keepAliveArmed = true;
+        logger.info('浏览器保持打开：等你在客户端配好参数后点页面上的「完成」（或终端按回车）');
+      } else {
+        await this.dropLoginHint();
+      }
       return this.capturedAuth;
     } finally {
-      await this.cleanup();
+      // ⚠️ 只有成功捕获且开了 keepAlive 才留窗；失败/取消必须关掉（别留孤儿浏览器）
+      if (!this.keepAliveArmed) await this.cleanup();
     }
   }
 
@@ -723,6 +812,95 @@ export class AuthCapture {
   }
 
   /** 清理浏览器资源。 */
+  /**
+   * 「完成」闸门：把页面横幅换成「已捕获登录凭证」，**等用户点「完成」**（或终端回车）
+   * 再关浏览器。
+   *
+   * 为什么要它（2026-10-16 用户要求）：凭证捕获完立刻关窗，用户还没来得及核对账号、
+   * 更没时间在客户端把模型名/参数设置好。现在凭证**已经落盘**（调用方在 `saveAs` 之后
+   * 才调这里），所以用户可以放心去配置，配好点「完成」即可。
+   *
+   * ⚠️ 无论走哪条路（点完成 / 回车 / 超时）都会关浏览器 —— 不能把窗口留在那里。
+   */
+  async finish(
+    options: {
+      accountId?: string;
+      identity?: string;
+      /** 建议客户端使用的模型名（默认用平台 id，即模型名）。 */
+      modelHint?: string;
+      timeoutSeconds?: number;
+    } = {},
+  ): Promise<void> {
+    try {
+      if (!this.page) return;
+      const timeoutSeconds = options.timeoutSeconds ?? FINISH_GATE_TIMEOUT_SECONDS;
+      const content = loginHintContent({
+        platformName: platformDisplayName(this.platform),
+        elapsedSeconds: 0,
+        timeoutSeconds,
+        tone: 'captured',
+        accountId: options.accountId,
+        identity: options.identity,
+        modelHint: options.modelHint ?? this.platform,
+      });
+
+      let enterPressed = false;
+      const onStdinData = (): void => {
+        enterPressed = true;
+      };
+      const listenStdin = Boolean(process.stdin.isTTY);
+      if (listenStdin) {
+        process.stdin.resume();
+        process.stdin.on('data', onStdinData);
+      }
+
+      try {
+        const deadline = Date.now() + timeoutSeconds * 1000;
+        for (;;) {
+          // 一次 evaluate 完成「刷新横幅 + 读走按钮动作」
+          if ((await this.applyLoginHint(content)) === 'finish') {
+            logger.info('用户点了「完成」，关闭浏览器');
+            return;
+          }
+          if (enterPressed) {
+            logger.info('终端回车确认，关闭浏览器');
+            return;
+          }
+          if (Date.now() >= deadline) {
+            logger.warn(`等待「完成」超过 ${timeoutSeconds}s，自动关闭浏览器`);
+            return;
+          }
+          await sleep(1000);
+        }
+      } finally {
+        if (listenStdin) {
+          process.stdin.off('data', onStdinData);
+          process.stdin.pause();
+        }
+      }
+    } finally {
+      await this.cleanup();
+      this.keepAliveArmed = false;
+    }
+  }
+
+  /**
+   * 无条件关闭浏览器（幂等）。
+   *
+   * 调用方在**任何早退分支**上都要调它 —— `keepAlive` 模式下浏览器不会自己关，
+   * 忘了调就会留一个孤儿窗口（`webaiapi start` 有 `sweepOrphanBrowsers` 兜底，
+   * 但 CLI 交互流程不该依赖它）。
+   */
+  async dispose(): Promise<void> {
+    try {
+      await this.dropLoginHint();
+    } catch {
+      // 忽略
+    }
+    this.keepAliveArmed = false;
+    await this.cleanup();
+  }
+
   private async cleanup(): Promise<void> {
     try {
       if (this.page) await this.page.close();

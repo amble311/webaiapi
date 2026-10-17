@@ -25,6 +25,7 @@ import { getApiKeys, settings } from '../config.js';
 import { getHistoryDb } from '../controllers/history-db.js';
 import { getModelRouter } from '../controllers/router.js';
 import { resetApiLog } from '../log/api-logger.js';
+import { removePidFileIfOwned, writePidFile } from './pidfile.js';
 import { logger } from '../log/logger.js';
 import { ensureFirefox } from '../browser/ensure-firefox.js';
 import { disposeAllChannels, disposeSharedBrowser } from '../browser/manager.js';
@@ -286,6 +287,10 @@ export async function startServer(): Promise<number> {
     throw error;
   }
   logger.info(`服务已启动: ${url}`);
+  /* 写 pid 文件：后台/`nohup` 启动时也能用 `webaiapi stop` 停掉（2026-10-16 用户要求）。
+   * 前台跑照样写 —— 只是 Ctrl-C 时就把它删掉了。 */
+  writePidFile(process.pid);
+  logger.debug(`PID 文件已写入: ${process.pid}`);
 
   // ===== 优雅关闭 =====
   const shutdown = async (signal: string): Promise<void> => {
@@ -309,8 +314,12 @@ export async function startServer(): Promise<number> {
     } catch {
       // 忽略
     }
+    removePidFileIfOwned();
     logger.info('应用已关闭');
   };
+
+  // 兜底：无论怎么退出都别留下陈旧 pid 文件（否则 `stop` 会对着死 pid 报错）
+  process.once('exit', () => removePidFileIfOwned());
 
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     process.once(signal, () => {

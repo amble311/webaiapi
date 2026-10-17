@@ -2,7 +2,7 @@
 
 [中文文档](https://github.com/amble311/webaiapi/blob/main/README.md) | **English**
 
-Wrap an **AI chat web UI** (currently **ChatGLM**) into an **OpenAI-compatible API**.
+Wrap an **AI chat web UI** (currently **ChatGLM / DeepSeek**) into an **OpenAI-compatible API**.
 Pure browser automation (Playwright Firefox) — **no API key, no reverse-engineered signatures**.
 You just log in once, in a real browser window.
 
@@ -84,6 +84,8 @@ In your client set the base URL to `http://localhost:8631/v1`, put any string as
 | `webaiapi start` | Start the server (foreground, Ctrl-C to quit) |
 | `webaiapi doctor` | Self-check: Node / Firefox / credentials / port |
 | `webaiapi status` | Runtime state: accounts, roles, auxiliary channel, request pool |
+| `webaiapi stop` | Stop a background-started service (reads the PID file written by `start`; `--force` to kill) |
+| `webaiapi model` | **Available model ids + client config suggestions** (`--json` for machine-readable) |
 | `webaiapi accounts` | Accounts and roles only (the authoritative view for multi-account) |
 | `webaiapi health` | Per-platform login status |
 | `webaiapi login [<platform>] [--account <id>]` | Log in and capture credentials (interactive if no args) |
@@ -194,6 +196,15 @@ npm run typecheck
 npm test
 npm run build      # emits dist/
 ```
+
+## Acknowledgements
+
+This project's browser automation is built entirely on
+[Playwright](https://github.com/microsoft/playwright) — credential capture, page injection,
+SSE sniffing and the anti-detection work all depend on it.
+
+Thanks to Playwright's authors and maintainers (Microsoft and all contributors):
+without this excellent project, webaiapi would not exist.
 
 ## License
 

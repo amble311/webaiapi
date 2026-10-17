@@ -2,7 +2,7 @@
 
 **中文** | [English](https://github.com/amble311/webaiapi/blob/main/README.en.md)
 
-把 AI 聊天网页（目前支持 **ChatGLM / 智谱清言**）包装成 **OpenAI 兼容 API**。
+把 AI 聊天网页（目前支持 **ChatGLM / 智谱清言** 与 **DeepSeek**）包装成 **OpenAI 兼容 API**。
 纯浏览器自动化（Playwright Firefox），**不需要 API Key、不需要逆向签名**——你只要在浏览器里登录一次。
 
 用它可以在任何支持 OpenAI 协议的客户端（CodeBuddy、Trae、Cursor、各类 SDK）里，
@@ -80,6 +80,8 @@ curl -N -X POST http://localhost:8631/v1/chat/completions \
 |---|---|
 | `webaiapi start` | 启动服务（前台运行，Ctrl-C 退出） |
 | `webaiapi doctor` | 自检：Node / Firefox / 凭证 / 端口 |
+| `webaiapi stop` | 停止后台启动的服务（读 `start` 写的 PID 文件；`--force` 强杀） |
+| `webaiapi model` | **可用模型 id + 配置建议**（配客户端前先看它；`--json` 输出机器可读） |
 | `webaiapi status` | 运行状态：账号、角色、辅助通道、请求池 |
 | `webaiapi accounts` | 只看账号与角色（判断「多账号有没有生效」的权威视图） |
 | `webaiapi health` | 各平台登录状态 |
@@ -182,9 +184,17 @@ CHATGLM_MAIN_ACCOUNT=acc2 webaiapi start
 npm install        # 会自动 build（package.json 的 prepare 脚本）
 npm run dev        # 直接跑 tsx src/cli.ts，不用先构建
 npm run typecheck
-npm test           # 单测（当前 466 个）
+npm test           # 单测（当前 586 个）
 npm run build      # 产出 dist/
 ```
+
+## 致谢
+
+本项目的浏览器自动化完全建立在 [Playwright](https://github.com/microsoft/playwright) 之上 ——
+登录态捕获、页面注入、SSE 抓取与反检测这些关键环节都依赖它。
+
+感谢 Playwright 的作者与维护者（Microsoft 及所有贡献者）：
+没有这个优秀的项目，webaiapi 不可能存在。
 
 ## 许可
 

@@ -34,7 +34,51 @@ import {
  */
 const P1_TOOL_CALL_PATTERN = /<tool_call>\s*(.*?)\s*<\/tool_call>/gsu;
 
-/** Pattern 2：`<tool_call name="X">{...}</tool_call` */
+/* ------------------------------------------------------------------ */
+/* DeepSeek 原生 DSML 工具调用（2026-10-16 实测补）                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * DeepSeek 的**原生**函数调用格式（它的特殊 token 用全角竖线 `｜` U+FF5C）：
+ *
+ * ```
+ * <｜｜DSML｜｜ calls>
+ * <｜｜DSML｜｜ invoke name="list_dir">
+ * <｜｜DSML｜｜ parameter name="target_directory" string="true">/home/amble/object/btc</｜｜DSML｜｜ parameter>
+ * <｜｜DSML｜｜ parameter name="ignore_globs" string="true">（这里是忽略 glob 的 JSON 数组）</｜｜DSML｜｜ parameter>
+ * </｜｜DSML｜｜ invoke>
+ * </｜｜DSML｜｜ calls>
+ * ```
+ *
+ * ⚠️ 为什么会遇到：我们注入的是自己的文本协议（`<tool_call>{…}</tool_call>`），
+ * 但 deepseek 网页端模型在「要调工具了」时**有时会直接吐它自己训练里的原生格式** ——
+ * 此时若不识别，整段 XML 会被当正文原样透传给客户端（用户看到一堆 `｜｜DSML｜｜`，
+ * 2026-10-16 实测；那一轮 340 字符全是这个，一个工具调用都没解析出来）。
+ *
+ * 容错：竖线允许半角/全角、1~2 个，且允许竖线与 `DSML` 之间有空格。
+ */
+/** `<｜｜DSML｜｜`（竖线半角/全角、1~2 个、允许空格）。 */
+const DSML_DELIM = '<[|｜]{1,2}\\s*DSML\\s*[|｜]{1,2}\\s*';
+/**
+ * 整块：`<…DSML｜｜ calls>` … `</…DSML｜｜ calls>`。
+ *
+ * ⚠️ 结束符**必须是带 calls 的那个**：实测模型会在中间写**无名闭合**
+ * （`</｜｜DSML｜｜>` 关 invoke）—— 若这里允许 `calls` 缺失，块会在那里提前收尾，
+ * 残留 `</…calls>` 留在正文里（2026-10-17 实测）。
+ */
+const DSML_CALLS_PATTERN = new RegExp(
+  DSML_DELIM + 'calls\\s*>([\\s\\S]*?)</[|｜]{1,2}\\s*DSML\\s*[|｜]{1,2}\\s*calls\\s*>',
+  'gu',
+);
+/**
+ * 块内按分隔符切分：每段形如 `invoke name="x">` / `parameter name="y" …>值` /
+ * `/parameter>` / `/invoke>`（闭合片段）。
+ *
+ * ⚠️ 必须允许 `<` 后面跟 `/`（闭合标签），否则闭合串会粘在**上一个参数值**的尾巴上
+ * （实测 `timeout` 变成了 `180000</｜｜DSML｜｜ parameter>`）。
+ */
+const DSML_PIECE_SPLIT = new RegExp('</?' + '[|｜]{1,2}\\s*DSML\\s*[|｜]{1,2}\\s*', 'gu');
+
 const XML_TOOL_CALL_PATTERN =
   /<tool_call\s+name\s*=\s*["']([^"']+)["']\s*>(.*?)<\/tool_call/gsu;
 
@@ -109,6 +153,45 @@ export function rawDecodeJson(
 
 type Span = [number, number];
 
+/**
+ * 解析 DSML 参数值：**数组/数字/布尔都认**。
+ *
+ * ⚠️ 不能直接用 `tryParseJson`：它是给 `<tool_call>{…}</tool_call>` 写的，**只面向对象**
+ * （数组会返回 undefined 并打一行「JSON 解析失败」）——实测 `ignore_globs` 的
+ * `["…", "…"]` 就是这样被退回成字符串的，客户端拿到字符串而 schema 要数组。
+ */
+function parseDsmlValue(text: string): unknown {
+  const trimmed = text.trim();
+  if (!trimmed) return '';
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    // 再试一次宽松解码（智能引号 / Python 风格的字面量）
+    try {
+      const decoded = rawDecodeJson(trimmed) as unknown;
+      return decoded === undefined ? trimmed : decoded;
+    } catch {
+      return trimmed;
+    }
+  }
+}
+
+/**
+ * 给 DSML 调用的参数赋值。
+ *
+ * `string="true"` 只是平台的类型标注，但模型**常把 JSON 数组/对象塞进字符串参数**
+ * （实测 `ignore_globs`）→ 能解析成复合值时按复合值给客户端，否则保留字符串。
+ */
+function assignDsmlParam(args: Record<string, unknown>, param: RegExpExecArray): void {
+  const key = (param[1] ?? '').trim();
+  if (!key) return;
+  const attrs = param[2] ?? '';
+  const rawValue = (param[3] ?? '').trim();
+  const wantsString = /string\s*=\s*"true"/i.test(attrs);
+  const composite = /^[[{]/.test(rawValue);
+  args[key] = wantsString && !composite ? rawValue : parseDsmlValue(rawValue);
+}
+
 function spansOverlap(start: number, end: number, spans: ReadonlyArray<Span>): boolean {
   return spans.some(([s, e]) => start < e && end > s);
 }
@@ -168,6 +251,82 @@ export function parseToolCallsFromText(
 
     const start = match.index ?? 0;
     tryAdd(tryParseJson(raw), start, start + match[0].length);
+  }
+
+  // --- Pattern 1.5：DeepSeek 原生 DSML（见 DSML_DELIM 的说明） ---
+  for (const match of normalized.matchAll(DSML_CALLS_PATTERN)) {
+    const start = match.index ?? 0;
+    const end = start + match[0].length;
+    if (spansOverlap(start, end, removalSpans)) continue;
+
+    /* ⚠️⚠️ 解析方式：**按分隔符切分**，不依赖闭合标签的名字
+     * （2026-10-17 实测事故：模型写的是 `</｜｜DSML｜｜>` —— **无名闭合**，
+     *  而 parameter 的闭合却带名字。早期用「成对标签」正则 → invoke 体永远匹配不上
+     *  → 整轮 **0 个工具调用** → 客户端收到纯文本就结束回合，用户看到「突然停止」。）
+     *
+     * 切分后每段形状：`calls>` / `invoke name="bash">` /
+     * `parameter name="command" string="true">一段值` / 各种闭合片段（一律忽略）。
+     * 值天然止于下一个分隔符，所以不需要再剥离标签。
+     *
+     * ⚠️ 顺序很重要：**先把 invoke/parameter 全部收集完，再统一 buildToolCall**
+     * （在 invoke 那一刻构造会拿到空 args）。 */
+    const body = match[1] ?? '';
+    const invocations: Array<{ name: string; args: Record<string, unknown> }> = [];
+    let current: { name: string; args: Record<string, unknown> } | null = null;
+
+    for (const raw of body.split(DSML_PIECE_SPLIT)) {
+      const piece = raw.trim();
+      if (!piece) continue;
+
+      const invoke = /^invoke\s+name="([^"]+)"\s*>([\s\S]*)$/u.exec(piece);
+      if (invoke) {
+        const name = (invoke[1] ?? '').trim();
+        if (!name) {
+          current = null;
+          continue;
+        }
+        current = { name, args: {} };
+        invocations.push(current);
+        const rest = (invoke[2] ?? '').trim();
+        if (rest) {
+          const inlineParam = /^parameter\s+name="([^"]+)"([^>]*)>([\s\S]*)$/u.exec(rest);
+          if (inlineParam) assignDsmlParam(current.args, inlineParam);
+        }
+        continue;
+      }
+
+      const param = /^parameter\s+name="([^"]+)"([^>]*)>([\s\S]*)$/u.exec(piece);
+      if (param && current) assignDsmlParam(current.args, param);
+    }
+
+    for (const inv of invocations) {
+      const tc = buildToolCall(inv.name, inv.args, maps);
+      if (tc) toolCalls.push(tc);
+    }
+
+    // 整段 DSML 都要从可见正文里删掉：绝不把原始标记透给用户
+    if (body.trim()) removalSpans.push([start, end]);
+  }
+
+  /* 防御：有 `<…DSML｜｜ calls>` 开标记却没匹配到整块（例如结束符也缺名字）——
+   * 至少把从开标记到最后一个 `</…DSML` 的整段从正文里删掉，
+   * 绝不能让原始标记透给客户端（用户看到一堆 `｜｜DSML｜｜`）。 */
+  if (normalized.includes('DSML')) {
+    const openRe = new RegExp(DSML_DELIM + 'calls\\s*>', 'gu');
+    for (const m of normalized.matchAll(openRe)) {
+      const start = m.index ?? 0;
+      if (spansOverlap(start, start + m[0].length, removalSpans)) continue;
+      const tail = normalized.slice(start);
+      const lastClose = tail.lastIndexOf('</');
+      const dsmlClose = tail.search(/<\/[|｜]{1,2}\s*DSML/i);
+      if (dsmlClose < 0) continue;
+      // 取最后一个 DSML 闭合标记的结束位置
+      const re = /<\/[|｜]{1,2}\s*DSML[^>]*>/gu;
+      let lastEnd = -1;
+      for (const c of tail.matchAll(re)) lastEnd = (c.index ?? 0) + c[0].length;
+      if (lastEnd > 0) removalSpans.push([start, start + lastEnd]);
+      else if (lastClose > 0) removalSpans.push([start, start + lastClose]);
+    }
   }
 
   // --- Pattern 2 ---

@@ -175,24 +175,51 @@ export const SSE_CAPTURE_JS = `
     };
     XMLHttpRequest.prototype.send = function (...args) {
       const self = this;
+      // ⚠️ 必须按 URL 过滤：不过滤的话**任意 XHR**（设置轮询、埋点…）都会覆盖 xhrText，
+      //    实测 deepseek 的 completion 流就是这样被一个 95 字节的小请求盖掉（2026-10-16）。
+      let isStream = false;
+      try { isStream = _looksLikeStream('', self.__glmURL); } catch (e) { isStream = false; }
       try {
         // 侦察：请求体
-        if (_looksLikeStream('', self.__glmURL)) {
+        if (isStream) {
           let ctype = '';
           try { ctype = self.getRequestHeader ? (self.getRequestHeader('content-type') || '') : ''; } catch (e) {}
           _record(self.__glmMethod || 'POST', self.__glmURL, ctype, args[0]);
         }
       } catch (e) {}
-      try {
-        self.addEventListener('progress', () => {
-          try {
-            const t = self.responseText || '';
-            if (t) window.__glmSSE.xhrText = t;
-          } catch (e) {}
-        });
-      } catch (e) {}
+      if (isStream) {
+        try {
+          window.__glmSSE.urls.push(String(self.__glmURL || '').slice(0, 200));
+        } catch (e) {}
+        try {
+          self.addEventListener('progress', () => {
+            try {
+              const t = self.responseText || '';
+              if (t) window.__glmSSE.xhrText = t;
+            } catch (e) {}
+          });
+          self.addEventListener('load', () => {
+            try {
+              const t = self.responseText || '';
+              if (t) window.__glmSSE.xhrText = t;
+            } catch (e) {}
+          });
+        } catch (e) {}
+      }
       return _origSend.apply(self, args);
     };
   } catch (e) {}
 })();
 `;
+
+/**
+ * 重置捕获（开新对话 / 发新消息前调用）。
+ *
+ * ⚠️ 放在本文件是因为它操作的是本文件定义的 `window.__glmSSE*`；
+ * `chatglm-dom.ts` 只是**转发导出**（保持既有 import 不动），
+ * deepseek 等其它 provider 也直接从这里取，避免跨平台 import 平台专属文件。
+ */
+export const RESET_SSE_JS = `() => { if (window.__glmSSEReset) window.__glmSSEReset(); }`;
+
+/** 读取页面捕获到的 SSE 原始文本（`{ text, xhrText, done, urls, rawCount }`）。 */
+export const SSE_GET_JS = `() => (window.__glmSSEGet ? window.__glmSSEGet() : null)`;

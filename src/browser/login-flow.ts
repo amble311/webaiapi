@@ -42,7 +42,7 @@ import {
   type PlatformSpec,
 } from './platforms.js';
 import { logger } from '../log/logger.js';
-import { isGuestCredential } from './login-hint.js';
+import { identityStrength } from './platforms.js';
 import {
   bold,
   confirmYesNo,
@@ -462,6 +462,11 @@ async function loginOnPlatform(ctx: {
     headless: false,
     // 先不落盘：等拿到身份、定好账号名再写（见 AuthCaptureOptions.saveOnCapture）
     saveOnCapture: false,
+    /* 捕获成功后**不立刻关浏览器**：先落盘 + 打印账号/身份，再由本函数调
+     * `capture.finish()` 显示「已捕获登录凭证，请设置好模型参数后点击完成」，
+     * 用户点「完成」才关窗（2026-10-16 用户要求）。
+     * ⚠️ 因此本函数**每个早退分支都必须调 `capture.dispose()`**，否则会漏一个窗口。 */
+    keepAlive: true,
   });
 
   let captured: IdentityPrint;
@@ -489,6 +494,7 @@ async function loginOnPlatform(ctx: {
 
   if (captured.cookies === 0) {
     console.error('❌ 没有抓到任何 cookie —— 可能没登录成功。未写入任何文件。');
+    await capture.dispose();
     return 1;
   }
 
@@ -514,6 +520,7 @@ async function loginOnPlatform(ctx: {
       );
       if (proceed !== true) {
         console.log('已取消，未写入任何文件。');
+        await capture.dispose();
         return proceed === null ? 1 : EXIT_CANCELLED;
       }
     }
@@ -560,9 +567,13 @@ async function loginOnPlatform(ctx: {
         ],
       });
 
-      if (action === null) return EXIT_CANCELLED;
+      if (action === null) {
+        await capture.dispose();
+        return EXIT_CANCELLED;
+      }
       if (action === 'abort') {
         console.log('已取消，未写入任何文件。');
+        await capture.dispose();
         return 1;
       }
       finalId =
@@ -573,15 +584,18 @@ async function loginOnPlatform(ctx: {
   }
 
   /* ---------------- 5. 落盘 ---------------- */
-  /* ⚠️ 防覆盖闸门（2026-10-16 实测事故）：抓到的是**游客凭证**时**拒绝落盘**。
-   * chatglm 会给任何访客自动发一个匿名 token，那天这条路径把两份**真实账号**的凭证
-   * 覆盖成了游客凭证（各自靠 `.bak` 才救回来）。游客凭证对服务毫无用处
-   * （没有真实身份、额度极低），落盘只会造成损失。 */
-  if (isGuestCredential(platform, capture.capturedAuth)) {
+  /* ⚠️ 防覆盖闸门（2026-10-16 两起实测事故）：抓到的是**匿名会话凭证**时**拒绝落盘**。
+   * - chatglm 给任何访客发匿名 JWT（`is_guest: true`）→ 曾把两份**真实账号**凭证覆盖成游客凭证；
+   * - deepseek 的游客也有 `ds_session_id` cookie，会被提取成 `session:<id>` 身份
+   *   → 只看「有没有 identifier」就判定登录成功，还**多出了账号文件**（`session-<hash>.json`）。
+   * 判据统一走 `platforms.ts::identityStrength`（`session` = 匿名会话，`unknown` = 什么都没有）。 */
+  const strength = identityStrength(platform, capture.capturedAuth);
+  if (strength === 'session' || strength === 'unknown') {
     console.log('');
-    console.log(`${bold('✗ 抓到的是未登录的游客凭证，没有写入任何文件。')}`);
+    console.log(`${bold('✗ 只抓到匿名会话凭证，没有写入任何文件。')}`);
     console.log(
-      '  chatglm 会给任何访客自动发一个匿名 token —— 所以「页面打开完成」不等于「你已登录」。',
+      `  ${spec.displayName} 对**未登录的访客**也会下发会话 cookie/token ——` +
+        '所以「页面打开完成」不等于「你已经登录」。',
     );
     console.log(
       `  请重跑 ${bold('webaiapi login')}，在弹出的浏览器里**真正登录**` +
@@ -590,6 +604,7 @@ async function loginOnPlatform(ctx: {
     if (existing.length > 0) {
       console.log(`  （现有账号未被改动：${existing.map((acc) => acc.id).join(', ')}）`);
     }
+    await capture.dispose();
     return 1;
   }
 
@@ -598,6 +613,7 @@ async function loginOnPlatform(ctx: {
     file = capture.saveAs(finalId);
   } catch (error) {
     console.error(`保存凭证失败: ${String(error)}`);
+    await capture.dispose();
     return 1;
   }
 
@@ -640,6 +656,15 @@ async function loginOnPlatform(ctx: {
   console.log(`  ${dim('webaiapi accounts       查看账号与角色分配')}`);
   console.log(`  ${dim('webaiapi start          启动服务')}`);
   console.log(`  ${dim('（服务正在运行的话，重启它或等 30s 让辅助通道重扫）')}`);
+
+  /* 「完成」闸门：凭证**已经落盘**，浏览器先不关 —— 页面上显示「已捕获登录凭证，
+   * 请设置好模型参数后点击完成」，用户点「完成」（或终端回车、超时）才关窗。
+   * 好处：他能对着页面核对账号/身份，并在客户端把模型名等参数配置好。 */
+  await capture.finish({
+    accountId: finalId,
+    identity: captured.label,
+    modelHint: platform,
+  });
 
   return 0;
 }

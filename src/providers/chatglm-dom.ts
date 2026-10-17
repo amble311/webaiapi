@@ -213,10 +213,9 @@ export const DISMISS_OVERLAY_FALLBACK_JS = `() => {
 }`;
 
 /** 清空页面上的 SSE 捕获缓冲（每轮请求前调用）。 */
-export const RESET_SSE_JS = `() => { if (window.__glmSSEReset) window.__glmSSEReset(); }`;
+export { RESET_SSE_JS, SSE_GET_JS } from '../browser/sse-capture.js';
 
-/** 读取页面捕获到的 SSE 原始文本。 */
-export const SSE_GET_JS = `() => (window.__glmSSEGet ? window.__glmSSEGet() : null)`;
+/* `SSE_GET_JS` 见文件顶部从 `browser/sse-capture.js` 的转发导出。 */
 
 /**
  * 侦察：读取页面捕获到的**平台请求体**。

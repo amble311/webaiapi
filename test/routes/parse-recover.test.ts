@@ -111,6 +111,9 @@ function makeRouter(replies: string[], seen: string[]): ModelRouter {
 
   return {
     getAuxCandidates: () => [],
+    /* `streamWithFailover` 每次请求入口都会记录主通道平台（辅助通道据此优先同平台），
+     * 假 router 也要提供，否则真实代码那一行会抛错、恢复轮整个跑不起来。 */
+    noteMainPlatform: () => undefined,
     getProvider: async () => provider,
   } as unknown as ModelRouter;
 }
@@ -419,5 +422,65 @@ describe('parseAndRecoverToolCalls：模型调了客户端没有的工具', () =
     expect(outcome.parsedToolCalls).toEqual([]);
     expect(outcome.parsedText).toContain('本环境不存在的工具');
     expect(outcome.parsedText).not.toContain('<tool_call>');
+  });
+});
+
+/**
+ * ⭐ 批量下发策略（步骤 9）—— 2026-10-16 实测修正。
+ *
+ * 事故（用户报「模型不肯动手」）：模型一轮规划了 8 个调用
+ * （`search_content×4, read_file×2, execute_command×2`），旧策略「只要含写操作就**只发第一个**」
+ * 把它砍成 **1 个**，其余 7 个（含 4 次读）**凭空消失且模型不知道** → 它以为信息不全 →
+ * 重新读一遍……实测连续 **8 轮只读不写**。
+ *
+ * 新策略：**下发到「第一个写操作」为止**（它之前的只读调用照旧一起发），之后的丢弃。
+ * 保留的取舍：写操作会让后面调用的 `old_str` / 行号失效，必须等模型看到写的结果。
+ */
+describe('批量下发策略：含写操作时不再「只发第一个」', () => {
+  const run = async (source: string): Promise<string[]> => {
+    const seen: string[] = [];
+    const router = makeRouter(['不该被调用'], seen);
+    const outcome = await parseAndRecoverToolCalls({
+      parseSource: source,
+      fullResponse: source,
+      fromSse: true,
+      currentPlatform: 'chatglm',
+      prepared: prepared(),
+      modelRouter: router,
+      historyDb: {} as unknown as HistoryDB,
+      toolMaps: createToolMaps(TOOLS),
+      options: { fixPaths: false, validateSearchReplace: false },
+    });
+    return outcome.parsedToolCalls.map((tc) => tc.function.name);
+  };
+
+  const call = (name: string, args: Record<string, unknown>): string =>
+    `<tool_call>${JSON.stringify({ name, arguments: args })}</tool_call>`;
+
+  it('⭐ 读 + 读 + 写 + 写 → 下发前 3 个（事故前只剩 1 个）', async () => {
+    const source = [
+      call('list_dir', { target_directory: '/a' }),
+      call('list_dir', { target_directory: '/b' }),
+      call('bash', { command: 'rm /a' }),
+      call('bash', { command: 'rm /b' }),
+    ].join('\n');
+    expect(await run(source)).toEqual(['list_dir', 'list_dir', 'bash']);
+  });
+
+  it('第一个就是写 → 仍只发 1 个（保留「写后必须重规划」的取舍）', async () => {
+    const source = [
+      call('bash', { command: 'echo a' }),
+      call('list_dir', { target_directory: '/' }),
+    ].join('\n');
+    expect(await run(source)).toEqual(['bash']);
+  });
+
+  it('全只读 → 全部下发（不回归）', async () => {
+    const source = [
+      call('list_dir', { target_directory: '/a' }),
+      call('list_dir', { target_directory: '/b' }),
+      call('list_dir', { target_directory: '/c' }),
+    ].join('\n');
+    expect(await run(source)).toEqual(['list_dir', 'list_dir', 'list_dir']);
   });
 });

@@ -8,6 +8,8 @@
  * webaiapi start                     启动服务（前台阻塞）
  * webaiapi status                    查看运行状态（账号 / 辅助通道 / 请求池）
  * webaiapi accounts                  只看账号与角色
+ * webaiapi model                     可用模型 id 与客户端配置建议
+ * webaiapi stop                      停止后台启动的服务（--force 强杀）
  * webaiapi health                    健康检查
  * webaiapi login chatglm [--account x]  交互式登录并捕获凭证
  * webaiapi logout chatglm [--account x] 删除某账号的凭证
@@ -102,6 +104,8 @@ webaiapi —— 把 AI 聊天网页包装成 OpenAI 兼容接口
 用法:
   webaiapi login [<platform>] [--account <id>]   登录并捕获凭证（可多账号，交互式选择）
   webaiapi logout [<platform>] [--account <id>]   删除某账号的凭证（交互式选择）
+  webaiapi stop                                   停止服务（读 start 写的 PID 文件；--force 强杀）
+  webaiapi model                                  可用模型 id 与配置建议（配客户端前先看它）
   webaiapi accounts                               账号与角色（多账号是否生效的权威视图）
   webaiapi status                                 运行状态（模型路由 / 辅助通道 / 请求池）
   webaiapi health                                 健康检查（各平台登录状态）
@@ -245,6 +249,186 @@ async function cmdStatus(): Promise<number> {
 }
 
 /** `accounts` 子命令。 */
+/**
+ * `webaiapi model` —— 当前可用模型 + 配置建议。
+ *
+ * 数据来源与 `/v1/models` 相同（`buildModelCatalog`），再补上「平台状态」与「配置建议」：
+ * 用户配客户端时最需要的三件事就是 **base_url / 模型名 / 上下文长度**。
+ */
+/**
+ * `webaiapi stop` —— 停止后台启动的服务。
+ *
+ * 服务平时前台跑（Ctrl-C 即可），但用 `&` / `nohup` 丢到后台后，停它就得 `ps` 找 pid。
+ * 现在 `start` 会写 `~/.ai-api/webaiapi.pid`，这里读它 → SIGTERM 优雅停止：
+ * - 进程已死（陈旧 pid 文件）→ 清理并告知；
+ * - 命令行不像我们的服务（pid 复用）→ 拒绝，除非 `--force`；
+ * - 15s 没退出 → 提示加 `--force`（SIGKILL）。
+ * 没有 pid 文件时会探一下 HTTP 端口，如实告诉用户「在跑但不是我起的」还是「没在跑」。
+ */
+async function cmdStop(flags: Record<string, string | boolean>): Promise<number> {
+  const { pidFilePath, readPidFile, removePidFile, isProcessAlive, processCommandLine, looksLikeOurService } =
+    await import('./server/pidfile.js');
+  const { settings } = await import('./config.js');
+
+  const force = boolFlag(flags, 'force');
+  const file = pidFilePath();
+  const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+  /** 端口上有没有服务（没有 pid 文件时的兜底判断）。 */
+  const probeHealth = async (): Promise<boolean> => {
+    const host = settings.apiHost === '0.0.0.0' || settings.apiHost === '::' ? '127.0.0.1' : settings.apiHost;
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 2000);
+      try {
+        const resp = await fetch(`http://${host}:${settings.apiPort}${settings.apiPrefix}/health`, {
+          signal: controller.signal,
+        });
+        return resp.ok;
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch {
+      return false;
+    }
+  };
+
+  const pid = readPidFile();
+  if (!pid) {
+    if (await probeHealth()) {
+      console.log('⚠️ 服务在运行，但没有找到 PID 文件（可能不是用 `webaiapi start` 起的）。');
+      console.log(`   PID 文件位置: ${file}`);
+      console.log('   用 `ps -eo pid,cmd | grep webaiapi` 找到进程后手动停止；');
+      console.log('   下次改用 `webaiapi start` 启动就能用 `webaiapi stop` 了。');
+      return 1;
+    }
+    console.log('服务未在运行（没有 PID 文件，端口也没有响应）。');
+    return 0;
+  }
+
+  if (!isProcessAlive(pid)) {
+    console.log(`PID ${pid} 已经不在运行 → 清理陈旧的 PID 文件`);
+    removePidFile();
+    return 0;
+  }
+
+  const cmdline = processCommandLine(pid);
+  if (cmdline && !looksLikeOurService(cmdline)) {
+    console.log(`⚠️ PID ${pid} 看起来不是 webaiapi 服务：`);
+    console.log(`   ${cmdline.slice(0, 160)}`);
+    if (!force) {
+      console.log('   已拒绝停止（避免 pid 复用误杀）。确认要停请加 `--force`。');
+      return 1;
+    }
+    console.log('   已指定 --force，继续停止。');
+  }
+
+  console.log(`正在停止 webaiapi（PID ${pid}）...`);
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch (error) {
+    console.error(`发送 SIGTERM 失败: ${String(error)}`);
+    return 1;
+  }
+
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    await sleep(500);
+    if (!isProcessAlive(pid)) {
+      removePidFile();
+      console.log('✓ 已停止');
+      return 0;
+    }
+  }
+
+  if (!force) {
+    console.log('⚠️ 15s 内没有退出（可能在收尾后台任务）。要强制结束请加 `--force`。');
+    return 1;
+  }
+
+  console.log('仍未退出 → 强制结束（SIGKILL）');
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch (error) {
+    console.error(`发送 SIGKILL 失败: ${String(error)}`);
+    return 1;
+  }
+  await sleep(500);
+  const stillAlive = isProcessAlive(pid);
+  removePidFile();
+  console.log(stillAlive ? `⚠️ PID ${pid} 仍在运行，请手动检查` : '✓ 已强制停止');
+  return stillAlive ? 1 : 0;
+}
+
+async function cmdModel(flags: Record<string, string | boolean>): Promise<number> {
+  const { settings, getAvailableModelsList } = await import('./config.js');
+  const { ModelRouter, getModelRouter } = await import('./controllers/router.js');
+  const { buildModelCatalog, formatModelReport } = await import('./controllers/model-catalog.js');
+  const { PLATFORM_IDS, PLATFORMS_WITH_PROVIDER, platformDisplayName } = await import(
+    './browser/platforms.js'
+  );
+
+  const router = getModelRouter();
+  const catalog = buildModelCatalog({
+    configModels: getAvailableModelsList(),
+    platformModels: router.getAvailablePlatformModels(),
+    aliasModels: router.getAllModels(),
+    providerOfModel: (m: string) => router.platformOfModel(m),
+  });
+
+  const auxCapable = new Set<string>(ModelRouter.auxChannelPlatforms());
+  const platforms = PLATFORM_IDS.map((id) => {
+    let accounts: Array<{ id: string; label: string }> = [];
+    try {
+      accounts = listAccounts(id).map((acc) => ({
+        id: acc,
+        label: String(loadAuth(id, { accountId: acc })?.account_info?.label ?? ''),
+      }));
+    } catch {
+      accounts = [];
+    }
+    return {
+      id,
+      displayName: platformDisplayName(id),
+      accounts,
+      chatCapable: (PLATFORMS_WITH_PROVIDER as readonly string[]).includes(id),
+      auxCapable: auxCapable.has(id),
+    };
+  });
+
+  // `0.0.0.0` 是监听地址，客户端不该往它发请求 → 换成回环地址
+  const host = settings.apiHost === '0.0.0.0' || settings.apiHost === '::' ? '127.0.0.1' : settings.apiHost;
+  const baseUrl = `http://${host}:${settings.apiPort}${settings.apiPrefix}`;
+
+  if (boolFlag(flags, 'json')) {
+    console.log(
+      JSON.stringify(
+        {
+          base_url: baseUrl,
+          default_model: getAvailableModelsList()[0] ?? 'mix',
+          api_key_required: settings.apiKeyRequired,
+          models: catalog,
+          platforms,
+        },
+        null,
+        2,
+      ),
+    );
+    return 0;
+  }
+
+  console.log(
+    formatModelReport({
+      catalog,
+      platforms,
+      baseUrl,
+      apiKeyRequired: settings.apiKeyRequired,
+      defaultModel: getAvailableModelsList()[0] ?? 'mix',
+    }),
+  );
+  return 0;
+}
+
 async function cmdAccounts(): Promise<number> {
   const payload = await fetchJson('/status');
   if (!payload) {
@@ -423,11 +607,21 @@ export async function runCli(argv: ReadonlyArray<string> = process.argv): Promis
       return await startServer();
     }
 
+    /* `webaiapi stop`：停止后台启动的服务（配 `start` 写的 PID 文件，见 server/pidfile.ts）。 */
+    case 'stop':
+      return cmdStop(flags);
+
     case 'status':
       return cmdStatus();
 
     case 'accounts':
       return cmdAccounts();
+
+    /* `webaiapi model`：展示当前可用模型 id + 配置建议
+     * （与 `/v1/models` 共用 `controllers/model-catalog.ts`，避免两处走散）。 */
+    case 'model':
+    case 'models':
+      return cmdModel(flags);
 
     case 'health':
       return cmdHealth();
