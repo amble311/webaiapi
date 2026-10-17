@@ -135,6 +135,18 @@ export function initTokenJs(token: string): string {
 }
 
 /**
+ * 「已判定失效」的标记是否仍然有效（**纯函数**，便于单测）。
+ *
+ * 语义：标记**绑定到当时的 bearer** ——
+ * - 凭证没变 → 仍然失效（快速失败，不再重复导航）；
+ * - 凭证变了（用户重跑了 `webaiapi login`，bearer 换了）→ **自动解除**，允许重新尝试。
+ */
+export function isExpiryStillValid(recordedBearer: string | null, currentBearer: string): boolean {
+  if (!recordedBearer) return false;
+  return recordedBearer === currentBearer;
+}
+
+/**
  * 页面登录态分类（**纯函数**，便于单测）。
  *
  * | 返回 | 含义 | 处理 |
@@ -227,6 +239,15 @@ export class DeepSeekBrowserProvider extends BaseProvider {
    * 反复重写、始终未登录）。探针里能成功正是因为用了 init script。
    */
   private tokenInitInstalledFor: string | null = null;
+
+  /**
+   * 已判定「网页登录态失效」时记下**当时的 bearer**。
+   *
+   * ⚠️ 为什么要记住（2026-10-17 用户反馈）：会话失效时页面停在 `/sign_in`，
+   * 每次请求都重跑「导航 → 探测 → 种 token → 再导航 → 再探测」＝ 白花 20~30s，
+   * 日志里看起来像「一直在重试」。记住之后**直接快速失败**，等你重登（bearer 变了）自动解除。
+   */
+  private expiredForBearer: string | null = null;
 
   /** 上次把新 token 写回凭证的时间（节流用）。 */
   private lastTokenSync = 0;
@@ -335,6 +356,10 @@ export class DeepSeekBrowserProvider extends BaseProvider {
 
   /** 拿到可用页面（主通道 = 共享页面；辅助通道 = 独立 context 页面）。 */
   private async ensurePage(): Promise<Page> {
+    /* ⚠️ 已知失效（且凭证没变）→ 直接快速失败，不再启动/导航页面。
+     * 会话失效时页面停在 `/sign_in`，重跑整套流程只是白花时间（2026-10-17 用户反馈）。 */
+    if (this.isKnownExpired()) throw this.sessionExpiredError();
+
     if (this.page && !this.page.isClosed()) return this.page;
 
     if (this.channelKey) {
@@ -446,6 +471,10 @@ export class DeepSeekBrowserProvider extends BaseProvider {
       code: typeof raw.code === 'number' ? raw.code : null,
     });
 
+    /* 维护「已失效」标记：ok 清除；expired 记下（后续请求快速失败）。 */
+    if (state === 'ok') this.clearExpired();
+    if (state === 'expired') this.markExpired();
+
     // 顺手把新 token 写回凭证（限流）
     const fresh = String(raw.token ?? '');
     if (fresh) {
@@ -459,6 +488,33 @@ export class DeepSeekBrowserProvider extends BaseProvider {
     }
 
     return state;
+  }
+
+  /** 当前凭证里的 bearer（失败返回空串）。 */
+  private credentialBearer(): string {
+    return String(loadAuth(PLATFORM, { accountId: this.accountId })?.bearer ?? '');
+  }
+
+  /** 是否已知失效（凭证没变就继续快速失败；变了说明用户重登过 → 自动解除）。 */
+  private isKnownExpired(): boolean {
+    if (!isExpiryStillValid(this.expiredForBearer, this.credentialBearer())) {
+      if (this.expiredForBearer) {
+        logger.info('[deepseek] 凭证已更新（可能是重新登录）→ 解除「登录态失效」标记，重新尝试');
+      }
+      this.expiredForBearer = null;
+      return false;
+    }
+    return true;
+  }
+
+  /** 标记为失效（绑定当时的 bearer）。 */
+  private markExpired(): void {
+    this.expiredForBearer = this.credentialBearer() || 'unknown';
+  }
+
+  /** 探测到 ok 时清除标记。 */
+  private clearExpired(): void {
+    this.expiredForBearer = null;
   }
 
   /** 登录态失效时的统一错误（503 + 可操作提示，交给路由层原样回给客户端）。 */
@@ -490,10 +546,17 @@ export class DeepSeekBrowserProvider extends BaseProvider {
     }
 
     if (!visible) {
-      /* 自愈：页面可能停在「登录页 / 人机验证 / 上一次被搞坏 / 没加载完」。
-       * ⚠️ 2026-10-16 实测：token 覆盖 bug 会让页面卡在没有输入框的状态 —— 重新导航一次即可
-       * （token 注入现在只在「页面没有任何 token」时生效，不会再覆盖应用刷新出的新 token）。 */
-      logger.warn('[deepseek] 页面没有输入框 → 重新导航一次再试');
+      /* ⚠️⚠️ **没有输入框时先判登录态，而不是先重试**（2026-10-17 用户指出）：
+       * 会话失效时页面就是 `/sign_in`（或 token 被清空），重导航/重种 token 多少次都没用 ——
+       * 实测旧顺序白花 20~30s、日志看起来像「一直在重试」。
+       * 只有**登录态正常**（ok / unknown）时，才把「没有输入框」当作页面没加载完，
+       * 做**一次**自愈重导航。 */
+      const loginState = await this.probeSession(page);
+      if (loginState === 'expired') {
+        logger.warn('[deepseek] 页面没有输入框，且登录态已失效 → 立即停止重试');
+        throw this.sessionExpiredError();
+      }
+      logger.warn('[deepseek] 页面没有输入框（登录态正常）→ 重新导航一次再试');
       try {
         await navigateTo(CHAT_URL);
         await sleep(3000);

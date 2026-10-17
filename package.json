@@ -1,6 +1,6 @@
 {
   "name": "webaiapi",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Wrap AI chat web UIs (ChatGLM) into an OpenAI-compatible API — Playwright Firefox automation, no API key needed. 把 AI 聊天网页包装成 OpenAI 兼容 API（命令名：webaiapi）",
   "keywords": [
     "openai",

@@ -11,6 +11,7 @@ import { SSE_CAPTURE_JS } from '../../src/browser/sse-capture.js';
 import { PLATFORMS_WITH_PROVIDER } from '../../src/browser/platforms.js';
 import {
   classifyLoginState,
+  isExpiryStillValid,
   initTokenJs,
   guardDeepseekPrompt,
   DeepSeekBrowserProvider,
@@ -119,5 +120,24 @@ describe('classifyLoginState', () => {
 
   it('⭐ 请求本身失败（code=null，网络/WAF）→ unknown（**不拦**，避免抖动误杀账号）', () => {
     expect(classifyLoginState({ path: '/', hasToken: true, code: null })).toBe('unknown');
+  });
+});
+
+/**
+ * ⭐ 「已判定失效」标记的语义（2026-10-17 用户反馈：没有输入框时不该一直重试）。
+ *
+ * 标记**绑定到当时的 bearer**：凭证没变 → 继续快速失败；用户重登（bearer 变了）→ 自动解除。
+ */
+describe('isExpiryStillValid', () => {
+  it('⭐ 凭证没变 → 仍然失效（后续请求快速失败，不再重跑导航）', () => {
+    expect(isExpiryStillValid('BEARER_A', 'BEARER_A')).toBe(true);
+  });
+
+  it('⭐ 凭证变了（重新登录）→ 自动解除，允许重新尝试', () => {
+    expect(isExpiryStillValid('BEARER_A', 'BEARER_B')).toBe(false);
+  });
+
+  it('没有标记 → false（正常尝试）', () => {
+    expect(isExpiryStillValid(null, 'BEARER_A')).toBe(false);
   });
 });
