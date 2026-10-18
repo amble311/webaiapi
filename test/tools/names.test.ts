@@ -357,3 +357,72 @@ describe('buildToolCall', () => {
     expect(b?.function.name).toBe('Write');
   });
 });
+
+/**
+ * ⭐ 参数名要**以客户端 schema 为准**（2026-10-17 实测报错）：
+ * 客户端 `edit_file` 要 `path` / `search` / `replace`，而模型发的是
+ * `file_path` / `old_str` / `new_str`（Claude Code 那套，它训练里见得多）→
+ * 客户端直接报「未知参数 file_path、old_str、new_str」，两次都失败。
+ *
+ * 原实现是**朝 Claude 硬映射**（`path → file_path`），对现在的客户端正好反了。
+ * 现在：先把模型的名字归到「参数角色」，再取客户端里同角色的那个参数名。
+ */
+describe('normalizeToolArguments —— 以客户端 schema 为准（参数角色对齐）', () => {
+  const editMaps = createToolMaps([
+    {
+      type: 'function',
+      function: {
+        name: 'edit_file',
+        parameters: { properties: { path: {}, search: {}, replace: {}, replace_all: {} } },
+      },
+    },
+  ]);
+
+  it('⭐ 事故场景：file_path / old_str / new_str → path / search / replace', () => {
+    const out = normalizeToolArguments(
+      'edit_file',
+      { file_path: '/a/b.py', old_str: 'a=1', new_str: 'a=2' },
+      editMaps,
+    );
+    expect(out).toEqual({ path: '/a/b.py', search: 'a=1', replace: 'a=2' });
+  });
+
+  it('⭐ 客户端参数叫 path 时，不再被反向改成 file_path（原 bug）', () => {
+    const out = normalizeToolArguments('edit_file', { path: '/a', search: 'x', replace: 'y' }, editMaps);
+    expect(out).toEqual({ path: '/a', search: 'x', replace: 'y' });
+    expect(out['file_path']).toBeUndefined();
+  });
+
+  it('客户端用 file_path 的读工具：保持 file_path（不误改）', () => {
+    const readMaps = createToolMaps([
+      {
+        type: 'function',
+        function: { name: 'read_file', parameters: { properties: { file_path: {}, limit: {} } } },
+      },
+    ]);
+    expect(normalizeToolArguments('read_file', { file_path: '/x', limit: 30 }, readMaps)).toEqual({
+      file_path: '/x',
+      limit: 30,
+    });
+  });
+
+  it('客户端用 path 的读工具：file_path → path', () => {
+    const readMaps = createToolMaps([
+      {
+        type: 'function',
+        function: { name: 'read_file', parameters: { properties: { path: {}, limit: {} } } },
+      },
+    ]);
+    expect(normalizeToolArguments('read_file', { file_path: '/x' }, readMaps)).toEqual({ path: '/x' });
+  });
+
+  it('没有客户端 schema 时退回旧别名表（保持既有行为）', () => {
+    expect(normalizeToolArguments('read_file', { filePath: '/x' })).toEqual({ file_path: '/x' });
+  });
+
+  it('认不出的参数名保持原样（不瞎猜）', () => {
+    expect(normalizeToolArguments('edit_file', { something_else: 1 }, editMaps)).toEqual({
+      something_else: 1,
+    });
+  });
+});

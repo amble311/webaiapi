@@ -367,3 +367,42 @@ describe('parseToolCallsFromText — DSML 无名闭合 + 多行参数', () => {
     expect(out.text).not.toContain('DSML');
   });
 });
+
+/**
+ * ⭐ 2026-10-17 用户实测（回复里又出现 `<｜｜DSML｜｜ calls>`）：这次是**未闭合**的 DSML ——
+ * 模型只写了一个孤零零的开标记（没有闭合、没有 invoke），整块正则匹配不上 →
+ * 原始标记原样透给用户。修法：① 从开标记起**尽力解析** invoke；② 标记与参数值一律剥掉。
+ */
+describe('parseToolCallsFromText — 未闭合的 DSML（模型只写了个开头）', () => {
+  it('⭐ 只有开标记（用户报的原文）→ 标记不许透出，正文保留', () => {
+    const REAL = [
+      'docs 目录下的 06-data/ 只有 storage.md，缺少代理和币安接入的文档；',
+      'README 里写的默认端口 8666 也与实际使用的 1661 不一致。我接下来会补充并修正这些文档。',
+      '',
+      '<｜｜DSML｜｜ calls>',
+    ].join('\n');
+
+    const out = parseToolCallsFromText(REAL);
+    expect(out.toolCalls).toEqual([]);
+    expect(out.text).not.toContain('DSML');
+    expect(out.text).toContain('修正这些文档');
+  });
+
+  it('未闭合但已有 invoke/parameter → 调用照常解析，且标记与参数值都剥掉', () => {
+    const REAL = [
+      '我先看看目录',
+      '',
+      '<｜｜DSML｜｜ calls>',
+      '<｜｜DSML｜｜ invoke name="list_dir">',
+      '<｜｜DSML｜｜ parameter name="target_directory" string="true">/a</｜｜DSML｜｜ parameter>',
+    ].join('\n');
+
+    const out = parseToolCallsFromText(REAL);
+    expect(out.toolCalls).toHaveLength(1);
+    expect(out.toolCalls[0]?.function.name).toBe('list_dir');
+    expect(JSON.parse(String(out.toolCalls[0]?.function.arguments))).toEqual({
+      target_directory: '/a',
+    });
+    expect(out.text).toBe('我先看看目录');
+  });
+});

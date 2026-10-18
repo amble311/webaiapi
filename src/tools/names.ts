@@ -217,6 +217,37 @@ export function makeToolCallId(): string {
 }
 
 /** 通用别名：把各种写法归一化到标准参数名。 */
+/**
+ * 参数「角色」→ 各生态的常见写法（**归一化后**：只留小写字母）。
+ *
+ * ## ⚠️ 为什么需要（2026-10-17 实测）
+ * 模型会带**别家生态**的参数名：客户端 `edit_file` 要 `path` / `search` / `replace`，
+ * 而模型发的是 `file_path` / `old_str` / `new_str`（Claude Code 那套）→
+ * 客户端直接报「未知参数 file_path、old_str、new_str」✗。
+ *
+ * 原实现是**朝 Claude 风格硬映射**（`path → file_path`），对现在的客户端正好**反了** ✗。
+ * 现在改为：**以客户端 schema 为准**（`ToolMaps.param`）——先把模型的名字归到「角色」，
+ * 再取客户端里同角色的那个参数名。
+ */
+const PARAM_ROLE_ALIASES: Record<string, readonly string[]> = {
+  path: ['path', 'filepath', 'file', 'filename', 'targetdirectory', 'targetfile', 'dir'],
+  search: ['search', 'oldstr', 'oldstring', 'oldtext', 'old', 'find', 'pattern', 'match', 'target', 'from'],
+  replace: ['replace', 'newstr', 'newstring', 'newtext', 'new', 'replacement', 'text', 'to', 'body'],
+  replaceall: ['replaceall', 'all', 'global'],
+  content: ['content', 'filecontent', 'data'],
+  command: ['command', 'cmd', 'shell'],
+  cwd: ['cwd', 'workdir', 'workingdirectory'],
+  glob: ['glob', 'include', 'filter'],
+};
+
+/** 归一化后的参数名 → 角色（认不出返回 null）。 */
+function paramRole(normalizedKey: string): string | null {
+  for (const [role, names] of Object.entries(PARAM_ROLE_ALIASES)) {
+    if (names.includes(normalizedKey)) return role;
+  }
+  return null;
+}
+
 const GENERAL_ALIASES: Record<string, string> = {
   filePath: 'file_path',
   filepath: 'file_path',
@@ -269,31 +300,63 @@ const WRITE_FILE_ALIASES: Record<string, string> = {
 export function normalizeToolArguments(
   toolName: string,
   args: Record<string, unknown>,
+  maps: ToolMaps = EMPTY_TOOL_MAPS,
 ): Record<string, unknown> {
   if (!args || Object.keys(args).length === 0) return args;
 
   const name = TOOL_NAME_ALIASES[toolName] ?? toolName;
+  const clientParams = maps.param[toolName] ?? maps.param[name] ?? {};
+  const hasClientSchema = Object.keys(clientParams).length > 0;
+
   const normalized: Record<string, unknown> = {};
+  const renames: string[] = [];
 
   for (const [key, value] of Object.entries(args)) {
     let newKey = key;
     let isAlias = false;
 
-    if (key in GENERAL_ALIASES) {
-      newKey = GENERAL_ALIASES[key] as string;
-      isAlias = true;
+    if (hasClientSchema) {
+      /* ⚠️ **以客户端 schema 为准**（`ToolMaps.param` 的键是归一化名，值是客户端原始写法）：
+       * ① 已经是客户端的参数名（只是大小写/下划线不同）→ 直接用它的写法；
+       * ② 否则按「参数角色」找客户端里同角色的那个参数（`file_path`→`path`、
+       *    `old_str`→`search`、`new_str`→`replace` …）；
+       * ③ 都匹配不上 → 保留原名（让客户端报错，但至少不猜错）。 */
+      const normKey = normalizeParamKey(key);
+      const exact = clientParams[normKey];
+      if (exact) {
+        newKey = exact;
+      } else {
+        const role = paramRole(normKey);
+        if (role) {
+          for (const [clientNorm, clientRaw] of Object.entries(clientParams)) {
+            if (paramRole(clientNorm) === role) {
+              newKey = clientRaw;
+              isAlias = true;
+              break;
+            }
+          }
+        }
+      }
+    } else {
+      /* 没有客户端 schema（例如未注入工具定义）→ 退回旧别名表，保持既有行为。 */
+      if (key in GENERAL_ALIASES) {
+        newKey = GENERAL_ALIASES[key] as string;
+        isAlias = true;
+      }
+      if (key === 'path' && PATH_TO_FILE_PATH_TOOLS.has(name)) {
+        newKey = 'file_path';
+        isAlias = true;
+      }
+      if (name === 'SearchReplace' && key in SEARCHREPLACE_ALIASES) {
+        newKey = SEARCHREPLACE_ALIASES[key] as string;
+        isAlias = true;
+      } else if ((name === 'write_file' || name === 'Write') && key in WRITE_FILE_ALIASES) {
+        newKey = WRITE_FILE_ALIASES[key] as string;
+        isAlias = true;
+      }
     }
-    if (key === 'path' && PATH_TO_FILE_PATH_TOOLS.has(name)) {
-      newKey = 'file_path';
-      isAlias = true;
-    }
-    if (name === 'SearchReplace' && key in SEARCHREPLACE_ALIASES) {
-      newKey = SEARCHREPLACE_ALIASES[key] as string;
-      isAlias = true;
-    } else if ((name === 'write_file' || name === 'Write') && key in WRITE_FILE_ALIASES) {
-      newKey = WRITE_FILE_ALIASES[key] as string;
-      isAlias = true;
-    }
+
+    if (newKey !== key) renames.push(`${key}→${newKey}`);
 
     if (!(newKey in normalized)) {
       normalized[newKey] = value;
@@ -302,6 +365,10 @@ export function normalizeToolArguments(
       normalized[newKey] = value;
     }
     // 否则：已存在且当前是别名 → 不覆盖（标准名优先）
+  }
+
+  if (renames.length > 0) {
+    logger.info(`[tool_calls] 参数名按客户端 schema 纠正: ${renames.join(', ')}`);
   }
 
   return normalized;

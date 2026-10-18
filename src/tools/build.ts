@@ -79,7 +79,7 @@ export function buildToolCall(
     argsObj = {};
   }
 
-  argsObj = normalizeToolArguments(toolName, argsObj);
+  argsObj = normalizeToolArguments(toolName, argsObj, maps);
 
   // === 5. 映射到客户端真实参数名（file_path → filePath） ===
   const clientParams = maps.param[toolName];

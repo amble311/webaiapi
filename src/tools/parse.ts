@@ -77,6 +77,9 @@ const DSML_CALLS_PATTERN = new RegExp(
  * ⚠️ 必须允许 `<` 后面跟 `/`（闭合标签），否则闭合串会粘在**上一个参数值**的尾巴上
  * （实测 `timeout` 变成了 `180000</｜｜DSML｜｜ parameter>`）。
  */
+/** 任意 DSML 标记（开/闭、任意标签名、允许属性）：用于**兜底剔标记**。 */
+const DSML_TAG_TOKEN = /<\/?[|｜]{1,2}\s*DSML\s*[|｜]{1,2}[^>]*>/gu;
+
 const DSML_PIECE_SPLIT = new RegExp('</?' + '[|｜]{1,2}\\s*DSML\\s*[|｜]{1,2}\\s*', 'gu');
 
 const XML_TOOL_CALL_PATTERN =
@@ -192,6 +195,72 @@ function assignDsmlParam(args: Record<string, unknown>, param: RegExpExecArray):
   args[key] = wantsString && !composite ? rawValue : parseDsmlValue(rawValue);
 }
 
+/**
+ * 从 DSML 块体里收集 invoke / parameter。
+ *
+ * 按分隔符切分，**不依赖闭合标签的名字**（实测模型会写无名闭合 `</｜｜DSML｜｜>`）。
+ * 未闭合的块也用同一个函数（尽力解析）。
+ */
+function collectDsmlBody(body: string): {
+  invocations: Array<{ name: string; args: Record<string, unknown> }>;
+  /** 参数「值」在 body 里的区间（相对偏移）—— 未闭合块要把它们从正文里剥掉。 */
+  valueSpans: Array<[number, number]>;
+} {
+  const invocations: Array<{ name: string; args: Record<string, unknown> }> = [];
+  const valueSpans: Array<[number, number]> = [];
+  let current: { name: string; args: Record<string, unknown> } | null = null;
+
+  /* 用 matchAll 而不是 split：需要每段的**位置**（未闭合块只删参数值，保留正文）。 */
+  const pieces: Array<{ text: string; start: number }> = [];
+  let lastEnd = 0;
+  for (const m of body.matchAll(DSML_PIECE_SPLIT)) {
+    const at = m.index ?? 0;
+    pieces.push({ text: body.slice(lastEnd, at), start: lastEnd });
+    lastEnd = at + m[0].length;
+  }
+  pieces.push({ text: body.slice(lastEnd), start: lastEnd });
+
+  for (const piece of pieces) {
+    const raw = piece.text;
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+
+    const invoke = /^invoke\s+name="([^"]+)"\s*>([\s\S]*)$/u.exec(trimmed);
+    if (invoke) {
+      const name = (invoke[1] ?? '').trim();
+      if (!name) {
+        current = null;
+        continue;
+      }
+      current = { name, args: {} };
+      invocations.push(current);
+      const rest = (invoke[2] ?? '').trim();
+      if (rest) {
+        const inlineParam = /^parameter\s+name="([^"]+)"([^>]*)>([\s\S]*)$/u.exec(rest);
+        if (inlineParam) assignDsmlParam(current.args, inlineParam);
+      }
+      continue;
+    }
+
+    const param = /^parameter\s+name="([^"]+)"([^>]*)>([\s\S]*)$/u.exec(trimmed);
+    if (param && current) {
+      assignDsmlParam(current.args, param);
+      /* 值在 body 里的绝对区间：piece.start + 前导空白 + 「>」之后 + 值的前导空白 */
+      const lead = raw.length - raw.trimStart().length;
+      const value = param[3] ?? '';
+      const valueLead = value.length - value.trimStart().length;
+      const valueLen = value.trim().length;
+      if (valueLen > 0) {
+        const gt = trimmed.indexOf('>');
+        const valueStart = piece.start + lead + gt + 1 + valueLead;
+        valueSpans.push([valueStart, valueStart + valueLen]);
+      }
+    }
+  }
+
+  return { invocations, valueSpans };
+}
+
 function spansOverlap(start: number, end: number, spans: ReadonlyArray<Span>): boolean {
   return spans.some(([s, e]) => start < e && end > s);
 }
@@ -271,35 +340,7 @@ export function parseToolCallsFromText(
      * ⚠️ 顺序很重要：**先把 invoke/parameter 全部收集完，再统一 buildToolCall**
      * （在 invoke 那一刻构造会拿到空 args）。 */
     const body = match[1] ?? '';
-    const invocations: Array<{ name: string; args: Record<string, unknown> }> = [];
-    let current: { name: string; args: Record<string, unknown> } | null = null;
-
-    for (const raw of body.split(DSML_PIECE_SPLIT)) {
-      const piece = raw.trim();
-      if (!piece) continue;
-
-      const invoke = /^invoke\s+name="([^"]+)"\s*>([\s\S]*)$/u.exec(piece);
-      if (invoke) {
-        const name = (invoke[1] ?? '').trim();
-        if (!name) {
-          current = null;
-          continue;
-        }
-        current = { name, args: {} };
-        invocations.push(current);
-        const rest = (invoke[2] ?? '').trim();
-        if (rest) {
-          const inlineParam = /^parameter\s+name="([^"]+)"([^>]*)>([\s\S]*)$/u.exec(rest);
-          if (inlineParam) assignDsmlParam(current.args, inlineParam);
-        }
-        continue;
-      }
-
-      const param = /^parameter\s+name="([^"]+)"([^>]*)>([\s\S]*)$/u.exec(piece);
-      if (param && current) assignDsmlParam(current.args, param);
-    }
-
-    for (const inv of invocations) {
+    for (const inv of collectDsmlBody(body).invocations) {
       const tc = buildToolCall(inv.name, inv.args, maps);
       if (tc) toolCalls.push(tc);
     }
@@ -308,28 +349,39 @@ export function parseToolCallsFromText(
     if (body.trim()) removalSpans.push([start, end]);
   }
 
-  /* 防御：有 `<…DSML｜｜ calls>` 开标记却没匹配到整块（例如结束符也缺名字）——
-   * 至少把从开标记到最后一个 `</…DSML` 的整段从正文里删掉，
-   * 绝不能让原始标记透给客户端（用户看到一堆 `｜｜DSML｜｜`）。 */
-  if (normalized.includes('DSML')) {
-    const openRe = new RegExp(DSML_DELIM + 'calls\\s*>', 'gu');
-    for (const m of normalized.matchAll(openRe)) {
-      const start = m.index ?? 0;
-      if (spansOverlap(start, start + m[0].length, removalSpans)) continue;
-      const tail = normalized.slice(start);
-      const lastClose = tail.lastIndexOf('</');
-      const dsmlClose = tail.search(/<\/[|｜]{1,2}\s*DSML/i);
-      if (dsmlClose < 0) continue;
-      // 取最后一个 DSML 闭合标记的结束位置
-      const re = /<\/[|｜]{1,2}\s*DSML[^>]*>/gu;
-      let lastEnd = -1;
-      for (const c of tail.matchAll(re)) lastEnd = (c.index ?? 0) + c[0].length;
-      if (lastEnd > 0) removalSpans.push([start, start + lastEnd]);
-      else if (lastClose > 0) removalSpans.push([start, start + lastClose]);
+  /* --- Pattern 1.6：**未闭合**的 DSML（模型被打断 / 只写了个开头） ---
+   * 实测 2026-10-17（用户截图）：回复末尾只有一个孤零零的 `<｜｜DSML｜｜ calls>` ——
+   * 没有闭合、没有 invoke → 上面的整块正则匹配不上 → 原始标记**原样透给用户** ✗。
+   * 处理：① 从开标记起**尽力解析** invoke（能认出就认，别丢调用）；
+   *       ② 标记本身一律剔掉（对用户永远没有意义）。
+   * ⚠️ 兜底扫描那一遍是**最后一道保险**：正文里任何残留的 DSML 标记都不许出现。 */
+  const unclosedOpen = new RegExp(DSML_DELIM + 'calls\\s*>', 'gu');
+  for (const m of normalized.matchAll(unclosedOpen)) {
+    const start = m.index ?? 0;
+    if (spansOverlap(start, start + m[0].length, removalSpans)) continue;
+    const parsed = collectDsmlBody(normalized.slice(start));
+    for (const inv of parsed.invocations) {
+      const tc = buildToolCall(inv.name, inv.args, maps);
+      if (tc) toolCalls.push(tc);
+    }
+    /* 未闭合块：连**参数值**一起剥掉（否则 shell 命令之类的值会留在正文里）。 */
+    for (const [vs, ve] of parsed.valueSpans) {
+      const absStart = start + vs;
+      const absEnd = start + ve;
+      if (spansOverlap(absStart, absEnd, removalSpans)) continue;
+      removalSpans.push([absStart, absEnd]);
     }
   }
 
-  // --- Pattern 2 ---
+  /* 兜底：剔掉所有残留的 DSML 标记（不重叠才加 —— 应用删除是从后往前 splice）。 */
+  for (const tag of normalized.matchAll(DSML_TAG_TOKEN)) {
+    const start = tag.index ?? 0;
+    const end = start + tag[0].length;
+    if (spansOverlap(start, end, removalSpans)) continue;
+    removalSpans.push([start, end]);
+  }
+
+  // --- Pattern 2 ---  // --- Pattern 2 ---
   for (const match of normalized.matchAll(new RegExp(XML_TOOL_CALL_PATTERN.source, 'gsu'))) {
     const start = match.index ?? 0;
     const end = start + match[0].length;
