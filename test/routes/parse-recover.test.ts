@@ -368,7 +368,7 @@ describe('parseAndRecoverToolCalls：模型调了客户端没有的工具', () =
     }
   });
 
-  it('⭐ 重复调用抑制：同一工具+参数已执行 ≥2 次 → 不再下发（止住循环）', async () => {
+  it('⭐ 重复调用抑制：同一工具+参数已执行过 → 不再下发，并把原因告诉模型', async () => {
     const cmd = 'cd /home/amble/object/btc && ./start.sh status';
     const seen: string[] = [];
     const router = makeRouter(['不该被调用'], seen);
@@ -409,7 +409,10 @@ describe('parseAndRecoverToolCalls：模型调了客户端没有的工具', () =
     expect(seen).toEqual([]); // 不该再启动恢复轮
     expect(outcome.parsedToolCalls).toEqual([]); // 重复调用被拦下
     expect(outcome.finishReason).toBe('stop');
-    expect(outcome.parsedText).toBe('清理完成，无需进一步操作。');
+    // 正文保留模型的话，并**追加被抑制的原因**（2026-10-18 改：不告诉模型它就会换个说法重试）
+    expect(outcome.parsedText).toContain('清理完成，无需进一步操作。');
+    expect(outcome.parsedText).toContain('已跳过 1 个重复调用');
+    expect(outcome.parsedText).toContain('bash');
   });
 
   it('剩余预算不足时跳过恢复轮，但仍给出明确说明', async () => {

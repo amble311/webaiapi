@@ -16,13 +16,14 @@
  * 「草稿1 + 草稿2 + 最终答案」的乱码；而 SSE 文本是未经渲染的最终报文。
  * 详见 `docs/hard-constraints.md`。
  */
+import { analyzeRequest, assessCalls } from './progress.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, statSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
-import { getDefaultWorkspacePaths } from '../config.js';
+import { getDefaultWorkspacePaths, settings } from '../config.js';
 import { getHistoryDb } from '../controllers/history-db.js';
 import { getRequestPool } from '../controllers/request-pool.js';
 import { getModelRouter } from '../controllers/router.js';
@@ -81,7 +82,6 @@ import {
   CONTINUE_MAX_BUDGET,
   CONTINUE_MIN_BUDGET,
   TOTAL_TIME_BUDGET,
-  TOOL_ROUND_LIMIT,
   detectMismatchedAnswer,
   extractUserQuestion,
   findToolUnavailableClaim,
@@ -337,22 +337,44 @@ export async function preparePrompt(
       .join(' > ')}, last_user_idx=${lastUserIdx}, tool_round_count=${toolRoundCount}`,
   );
 
-  /* ===== 轮数上限截停 =====
-   * ⚠️ 结束语必须**如实说明被截停**：旧文案是「操作已完成。」，
-   * 实测用户「帮我修复这几处」时读了 8 个文件就撞上限被截停，
-   * 客户端显示「操作已完成。」但**一个文件都没改** —— 严重误导。 */
-  if (toolRoundCount >= TOOL_ROUND_LIMIT) {
+  /* ===== 进展判据截停（替代 24 轮硬上限，2026-10-18）=====
+   * 判据从「轮数」改成「**有没有进展**」：
+   * - **僵局**：连续 `toolStallRounds` 轮全部是重复调用（原地打转）→ 截停；
+   * - **应急上限**：`toolRoundHardLimit` 轮（只防真无限，正常任务碰不到）。
+   * ⚠️ 为什么换：硬上限会把「庞大项目的正常探索」（读 40 个文件、每轮都是新目标）也砍掉 ✗；
+   * 而真正该拦的是「原地重复读取」。
+   * ⚠️ 结束语必须**如实说明被截停**（旧文案「操作已完成。」实为一个文件都没改，严重误导）。 */
+  const history = analyzeRequest(
+    messages as ReadonlyArray<{ role?: string; tool_calls?: unknown }>,
+    lastUserIdx,
+  );
+
+  if (history.stallStreak >= settings.toolStallRounds) {
     logger.warn(
-      `[tool_calls] 当前用户请求下工具调用已达 ${toolRoundCount} 轮` +
-        `（上限 ${TOOL_ROUND_LIMIT}），返回截停说明`,
+      `[tool_calls] 连续 ${history.stallStreak} 轮没有任何进展（全是重复调用）→ 截停` +
+        `（阈值 ${settings.toolStallRounds}）`,
     );
     return {
       kind: 'limit_exceeded',
       toolRoundCount,
       message:
-        `⚠️ 本轮工具调用已达上限（${toolRoundCount} 轮），` +
-        '任务可能尚未完成。请回复「继续」让我接着处理，' +
-        '或把任务拆小一点（例如一次只让我改一个文件）。',
+        `⚠️ 我注意到连续 ${history.stallStreak} 轮都在重复同样的调用（读同一个文件/跑同一条命令），` +
+        '所以先停下来。\n\n' +
+        '请告诉我具体要改哪里（文件 + 改成什么），或换个方向；' +
+        '也可以回复「继续」让我再试，但这次我会换目标、不重复读。',
+    };
+  }
+
+  if (toolRoundCount >= settings.toolRoundHardLimit) {
+    logger.warn(
+      `[tool_calls] 工具调用达应急上限 ${settings.toolRoundHardLimit} 轮（已运行 ${toolRoundCount} 轮）→ 截停`,
+    );
+    return {
+      kind: 'limit_exceeded',
+      toolRoundCount,
+      message:
+        `⚠️ 本轮工具调用已达应急上限（${toolRoundCount} 轮），任务可能尚未完成。` +
+        '请回复「继续」让我接着处理，或把任务拆小一点（例如一次只让我改一个文件）。',
     };
   }
 
@@ -380,7 +402,9 @@ export async function preparePrompt(
         }
       }
 
-      if (allReadOnly && toolRoundCount >= 3) {
+      /* ⚠️ 2026-10-18：只在「**真的出现重复**」时才催。
+       * 旧条件只看「连续 3 轮只读」→ 庞大项目的正常探索（每轮都是新文件）也被误催 ✗。 */
+      if (allReadOnly && toolRoundCount >= 3 && history.stallStreak > 0) {
         /* 连续读了 3 轮却没修改 → 催一下，避免「只读不写」空转。
          * ⚠️ 两个坑：
          *   1. 不要硬编码工具名（曾写死 SearchReplace，而 CodeBuddy 的真实工具是
@@ -397,7 +421,9 @@ export async function preparePrompt(
           // ⚠️ 2026-10-14 实测：模型会把这段指令**原文抄进回答**
           //    （「仔细看看，系统注释说：[重要] 上述工具调用已经执行完毕…」），整轮空转。
           '**不要引用或复述本段说明，直接动手。**';
-        logger.info(`[tool_calls] 检测到 ${toolRoundCount} 轮只读不写，注入强制修改指令`);
+        logger.info(
+          `[tool_calls] 检测到 ${toolRoundCount} 轮只读且出现重复（stall=${history.stallStreak}），注入强制修改指令`,
+        );
       } else {
         roundInstruction =
           '\n\n[重要] 上述工具调用已经执行完毕，结果如上所示。' +
@@ -478,39 +504,6 @@ export async function preparePrompt(
 /* ==================================================================== */
 /* 阶段 2：工具调用解析与降级恢复                                       */
 /* ==================================================================== */
-
-/** 重复调用抑制的阈值：历史里同一「工具名 + 参数」出现次数达到它就拦下。 */
-const REPEAT_CALL_LIMIT = 2;
-
-/** 调用指纹：`工具名|规范化后的参数 JSON`（忽略键顺序与空白）。 */
-function toolCallFingerprint(tc: {
-  function?: { name?: string; arguments?: unknown };
-}): string {
-  const name = tc?.function?.name ?? '';
-  const raw = tc?.function?.arguments;
-  let args = typeof raw === 'string' ? raw : JSON.stringify(raw ?? {});
-  try {
-    args = JSON.stringify(JSON.parse(args));
-  } catch {
-    // 参数不是合法 JSON（半截/脏数据）→ 用原文比对
-  }
-  return `${name}|${args}`;
-}
-
-/** 统计客户端历史里**已经执行过**的工具调用（指纹 → 次数）。 */
-function countHistoryToolCalls(messages: ReadonlyArray<unknown>): Map<string, number> {
-  const counts = new Map<string, number>();
-  for (const m of messages) {
-    const md = messageToDict(m as ChatMessage);
-    const tcs = md.tool_calls;
-    if (!Array.isArray(tcs)) continue;
-    for (const tc of tcs) {
-      const key = toolCallFingerprint(tc as { function?: { name?: string; arguments?: unknown } });
-      counts.set(key, (counts.get(key) ?? 0) + 1);
-    }
-  }
-  return counts;
-}
 
 /** SSE 报文里原始 tool_call 的形状（来自 ChatGLM 的 SSE）。 */
 interface RawSseToolCall {
@@ -879,11 +872,26 @@ export async function parseAndRecoverToolCalls(params: {
   /** 被「客户端没有这个工具」丢掉的调用名 / 原文（恢复轮要用）。 */
   let droppedUnknownNames: string[] = [];
   let droppedUnknownCalls: string[] = [];
+  /** 被抑制的调用及其原因（会写进正文告诉模型，避免它换个说法继续重试）。 */
+  const suppressedNotes: string[] = [];
+
   /** 被「重复调用抑制」丢掉的调用原文（回退正文要用）。 */
   let suppressedRepeats: string[] = [];
 
   /** 客户端历史里已执行过的调用指纹 → 次数（重复调用抑制用）。 */
-  const historyCallCounts = countHistoryToolCalls(prepared.request.messages);
+  /* 本轮任务的「进展/重复」历史（2026-10-18：判据从「出现两次就拦」升级为「有没有进展」）。
+   * 只统计**最后一条 user 消息之后**的调用 —— 用户回「继续」就重新计数。 */
+  const lastUserIdxForHistory = (() => {
+    let idx = -1;
+    prepared.request.messages.forEach((m, i) => {
+      if (messageToDict(m as ChatMessage).role === 'user') idx = i;
+    });
+    return idx;
+  })();
+  const roundHistory = analyzeRequest(
+    prepared.request.messages as ReadonlyArray<{ role?: string; tool_calls?: unknown }>,
+    lastUserIdxForHistory,
+  );
 
   /** 统一的过滤链：占位符 → 未知工具名 → 签名改派 → 命令误填 → 重复调用抑制。 */
   const filterToolCalls = (
@@ -933,28 +941,24 @@ export async function parseAndRecoverToolCalls(params: {
       }
     }
 
-    /* 重复调用抑制（2026-10-14，止住真实死循环）：
-     * 客户端历史里「同一工具 + 同一参数」已经执行过 ≥2 次，说明模型在原地打转
-     * （实测：`bash ./start.sh status` 被反复重发，每次还配同一段收尾结论）。
-     * 再下发只会让客户端的 agent 循环继续转 → 抑制它，让本轮以文本结束。
-     * 阈值取 2：允许模型复核一次，第三次起才拦。 */
+    /* 重复抑制（2026-10-18 改判据）：从「同一调用出现两次就拦」升级为「**有没有进展**」——
+     * - **参数级**：完全相同的调用已执行过（键顺序/空白不同也算同一个）；
+     * - **目标级**：同一目标（文件/目录/pattern）已读过 N 次且**期间没被改过**
+     *   （模型换个 limit/offset 重读同一文件也算重复）；
+     * - ⚠️ **写过的目标允许重读**（改完要验证）；写操作本身不会被目标级拦。
+     * 被抑制的原因会写进正文告诉模型 —— 否则它不知道为什么没结果，会换个说法继续重试。 */
     if (current.length > 0) {
-      const kept: ToolCallPayload[] = [];
-      for (const tc of current) {
-        const seen = historyCallCounts.get(toolCallFingerprint(tc)) ?? 0;
-        if (seen >= REPEAT_CALL_LIMIT) {
-          suppressedRepeats.push(`${tc.function?.name ?? '?'}(${tc.function?.arguments ?? ''})`);
-          continue;
+      const assessment = assessCalls(current, roundHistory);
+      if (assessment.suppressed.length > 0) {
+        for (const item of assessment.suppressed) {
+          suppressedRepeats.push(`${item.name}(${item.argsPreview})`);
+          suppressedNotes.push(`${item.name}：${item.reason}`);
         }
-        kept.push(tc);
-      }
-      if (kept.length !== current.length) {
         logger.warn(
-          `[tool_calls] 抑制 ${current.length - kept.length} 个重复调用` +
-            `（同一工具+参数在客户端历史里已执行 ≥${REPEAT_CALL_LIMIT} 次）`,
+          `[tool_calls] 抑制 ${assessment.suppressed.length} 个重复调用（参数级/目标级）`,
         );
       }
-      current = kept;
+      current = assessment.keep as ToolCallPayload[];
     }
 
     return { calls: current, droppedNames };
@@ -1233,6 +1237,14 @@ export async function parseAndRecoverToolCalls(params: {
   logger.info(
     `[tool_calls] 最终结果: 文本长度=${parsedText.length}, 工具调用数=${parsedToolCalls.length}`,
   );
+
+  /* 把「哪些调用被当成重复抑制了」告诉模型：否则它不知道为什么没结果，会换个说法重试。 */
+  if (suppressedNotes.length > 0) {
+    const brief = suppressedNotes.slice(0, 5).join('；');
+    parsedText =
+      `${parsedText}${parsedText ? '\n\n' : ''}` +
+      `（已跳过 ${suppressedNotes.length} 个重复调用：${brief}）`;
+  }
 
   return {
     parsedText,

@@ -42,6 +42,21 @@ export interface Settings {
   debugLogs: boolean;
 
   availableModels: string;
+
+  /**
+   * 「僵局熔断」：连续多少轮**完全没有进展**（全部是重复调用）就截停。
+   *
+   * ⚠️ 这是替代「24 轮硬上限」的判据（2026-10-18）：硬上限会把**庞大项目的正常探索**
+   * 也砍掉；真正该拦的是「原地重复读取」。默认 3。
+   */
+  toolStallRounds: number;
+
+  /**
+   * 应急上限：单次请求最多多少轮工具调用（只防真无限，正常任务碰不到）。默认 150。
+   *
+   * ⚠️ 这是**最后一道保险**，不是常规判据 —— 常规由 `toolStallRounds` 管。
+   */
+  toolRoundHardLimit: number;
   apiKeys: string;
   apiKeyRequired: boolean;
   rateLimitPerMinute: number;
@@ -68,6 +83,8 @@ const ENV_KEYS: Record<string, keyof Settings> = {
   LOG_DIR: 'logDir',
   DEBUG_LOGS: 'debugLogs',
   AVAILABLE_MODELS: 'availableModels',
+  TOOL_STALL_ROUNDS: 'toolStallRounds',
+  TOOL_ROUND_HARD_LIMIT: 'toolRoundHardLimit',
   API_KEYS: 'apiKeys',
   API_KEY_REQUIRED: 'apiKeyRequired',
   RATE_LIMIT_PER_MINUTE: 'rateLimitPerMinute',
@@ -113,6 +130,8 @@ const DEFAULTS: Settings = {
   debugLogs: false,
 
   availableModels: 'mix',
+  toolStallRounds: 3,
+  toolRoundHardLimit: 150,
   apiKeys: '',
   apiKeyRequired: false,
   rateLimitPerMinute: 60,
