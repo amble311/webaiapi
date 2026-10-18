@@ -405,9 +405,20 @@ export class DeepSeekBrowserProvider extends BaseProvider {
       code: typeof raw.code === 'number' ? raw.code : null,
     });
 
-    /* 维护「已失效」标记：ok 清除；expired 记下（后续请求快速失败）。 */
+    /* 维护「已失效」标记：ok 清除；expired 记下（后续请求快速失败）。
+     * ⚠️ 同时把**判定依据**写进日志（用户 2026-10-18 要求「失效原因写进日志」）：
+     * 区分「被踢到 /sign_in」「页面没有 token」「API 明确拒绝（code）」——
+     * 这三者的处理方式完全不同（重登 / 重新种 token / 可能只是 token 失效）。 */
     if (state === 'ok') this.clearExpired();
-    if (state === 'expired') this.markExpired();
+    if (state === 'expired') {
+      this.markExpired();
+      logger.warn(
+        `[deepseek] ${this.accountId} 登录态失效：path=${String(raw.path ?? '')} ` +
+          `hasToken=${String(raw.hasToken)} code=${String(raw.code)}`,
+      );
+    } else if (state === 'unknown') {
+      logger.debug(`[deepseek] ${this.accountId} 登录态未知（请求本身失败，不拦）`);
+    }
 
     // 顺手把新 token 写回凭证（限流）
     const fresh = String(raw.token ?? '');

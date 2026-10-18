@@ -389,6 +389,7 @@ export class ModelRouter {
      * 同平台没有副账号时才退到其它已启用辅助通道的平台（用户要求）。 */
     const preferred = mainPlatform ?? this.lastMainPlatform ?? undefined;
     const order = auxPlatformOrder(preferred, ModelRouter.AUX_CHANNEL_PLATFORMS);
+    const candidates: MixCandidate[] = [];
 
     for (const platform of order) {
 
@@ -441,11 +442,15 @@ export class ModelRouter {
         if (preferred && platform !== preferred) {
           logger.info(`[aux] 同平台（${preferred}）没有可用副账号 → 改用 ${platform} 的辅助通道`);
         }
-        return [[platform, provider, 1]];
+        /* ⚠️ 2026-10-18 改：**收集全部候选**而不是取第一个 ——
+         * 用户要求「辅助通道失败优先用其他同平台模型，然后找不同平台，最后回落主通道」。
+         * 顺序由 `auxPlatformOrder` 保证：主通道平台在前，其余按声明顺序。
+         * 失败逐级回落由 `streamWithFailover` 负责（它拿到的就是这个有序列表）。 */
+        candidates.push([platform, provider, 1]);
       }
     }
 
-    return [];
+    return candidates;
   }
 
   /**
@@ -726,6 +731,23 @@ export class ModelRouter {
   }
 
   /** 所有 Provider（键 = 平台名）。 */
+  /**
+   * 当前服务**正在持有页面**的账号（`platform/accountId`）。
+   *
+   * 用途：`session-refresh` 会话保鲜任务要**跳过**它们 —— 同一个账号在两处同时使用
+   * 会互相顶掉网页会话（用户 2026-10-18 遇到的「跑着跑着登录态失效」很可能就是它）。
+   */
+  getInUseAccounts(): Set<string> {
+    const out = new Set<string>();
+    for (const [platform, provider] of this.providers) {
+      out.add(`${platform}/${provider.getAccountId()}`);
+    }
+    for (const [platform, provider] of this.auxProviders) {
+      out.add(`${platform}/${provider.getAccountId()}`);
+    }
+    return out;
+  }
+
   getAllProviders(): Map<string, BaseProvider> {
     return this.providers;
   }

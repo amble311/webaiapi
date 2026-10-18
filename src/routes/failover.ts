@@ -16,6 +16,7 @@
  * 所以这里不需要 `aclosing` 的等价物，**但绝不能把 `for await` 换成手动
  * `while (true) { iterator.next() }`**，那样就丢掉了这层语言级保障。
  */
+import type { BaseProvider } from '../providers/base.js';
 import { getLastRawSse } from '../providers/chatglm-sse.js';
 import type { ChatRequest, ChatResponse } from '../providers/base.js';
 import type { HistoryDB } from '../controllers/history-db.js';
@@ -235,55 +236,90 @@ export async function* streamWithFailover(
    * 于是只能退回主 provider 串行执行（功能正常但慢），用户观感是"辅助通道没生效"。
    * ⚠️ 若**所有平台所有账号只有一个可用**，`getAuxCandidates()` 返回空 → 自然回落到
    * 主候选串行执行，也就是"辅助与主共用同一个账号"（用户规则第三条）。 */
-  if (auxCandidates.length > 0) {
-    const auxCandidate = auxCandidates[0];
-    if (auxCandidate) {
-      const samePlatform = platformOf(auxCandidate[0]) === platformOf(platform);
-      logger.info(
-        `[_stream_with_failover] 辅助任务改用${samePlatform ? '同平台' : '其它平台'}独立通道 ` +
-          `${auxCandidate[0]}（账号 ${auxCandidate[1].getAccountId()}）`,
-      );
-      provider = auxCandidate[1];
-    }
+  /* 候选链（用户 2026-10-18 规则）：
+   *   ① 辅助通道：同平台副账号 → ② 其它平台的辅助通道 → ③ **主通道**（共用，串行）。
+   * `getAuxCandidates()` 已按「主通道平台优先」排好序，这里逐个试；
+   * ⚠️ 某个候选**已经吐过内容**再失败时**不能重试**（会把回复吐两遍）—— 直接抛。 */
+  const candidates: Array<{ label: string; provider: BaseProvider; isAux: boolean }> = [];
+  for (const [candidatePlatform, candidateProvider] of auxCandidates) {
+    const samePlatform = platformOf(candidatePlatform) === platformOf(platform);
+    candidates.push({
+      label: `${samePlatform ? '同平台' : '其它平台'}辅助通道 ${candidatePlatform}（账号 ${candidateProvider.getAccountId()}）`,
+      provider: candidateProvider,
+      isAux: true,
+    });
   }
-  logger.info('[chatglm] _stream_with_failover: 开始调用 provider.chat_stream()');
+  candidates.push({ label: `主通道 ${platform}`, provider, isAux: false });
 
   // 会话复用：同一会话只补发增量（provider 若无法复用会自动改发完整提示词）
   const ctx = chatRequest.context ?? {};
   const delta = typeof ctx['delta_message'] === 'string' ? ctx['delta_message'] : '';
-  if (delta && SESSION_REUSE_PLATFORMS.has(platformOf(platform))) {
-    chatRequest.message = delta;
-    logger.info(
-      `[session] 会话 ${convId} 复用 ${platform} 网页会话，` +
-        `只发增量 ${delta.length} 字符（完整提示词 ${originalMessage.length} 字符）`,
-    );
-  }
 
-  // API 日志：记录 AI 平台请求（平台名模型，发送前记录）
-  logAiPlatformRequest({
-    requestId,
-    platform,
-    messages: [{ role: 'user', content: chatRequest.message }],
-  });
+  let lastError: Error | null = null;
+  for (const candidate of candidates) {
+    const active = candidate.provider;
+    const activePlatform = platformOf(active.platform);
+    let emitted = false;
 
-  let emptyError: string | null = null;
-  for await (const chunk of provider.chatStream(chatRequest)) {
-    // 纯错误（无内容）记录下来，循环结束后再抛出，
-    // 保证生成器被正常关闭（否则 provider 的串行锁不会释放）
-    if (chunk.error && !(chunk.content ?? '').trim()) {
-      emptyError = chunk.error;
-      break;
+    try {
+      /* 每个候选都从「完整提示词」重新起算：会话复用只对**同平台**有效，
+       * 跨平台候选不能只发增量（对方网页里没有上文）。 */
+      chatRequest.message =
+        delta && activePlatform === platformOf(platform) && SESSION_REUSE_PLATFORMS.has(activePlatform)
+          ? delta
+          : originalMessage;
+      if (chatRequest.message === delta) {
+        logger.info(
+          `[session] 会话 ${convId} 复用 ${activePlatform} 网页会话，` +
+            `只发增量 ${delta.length} 字符（完整提示词 ${originalMessage.length} 字符）`,
+        );
+      }
+
+      logger.info(`[_stream_with_failover] 使用 ${candidate.label}`);
+      logAiPlatformRequest({
+        requestId,
+        platform: extractPlatformName(active.platform),
+        messages: [{ role: 'user', content: chatRequest.message }],
+      });
+
+      let emptyError: string | null = null;
+      for await (const chunk of active.chatStream(chatRequest)) {
+        // 纯错误（无内容）记录下来，循环结束后再抛出，
+        // 保证生成器被正常关闭（否则 provider 的串行锁不会释放）
+        if (chunk.error && !(chunk.content ?? '').trim()) {
+          emptyError = chunk.error;
+          break;
+        }
+        if ((chunk.content ?? '').trim()) emitted = true;
+        logger.debug(
+          `[_stream_with_failover] yield chunk, content_len=${chunk.content?.length ?? 0}`,
+        );
+        yield [chunk, activePlatform];
+      }
+
+      if (emptyError !== null) {
+        // 让上层把真实原因返回给客户端，避免「空回复 + 无任何说明」
+        throw new PlatformUnavailableError(activePlatform, `返回空内容: ${emptyError}`);
+      }
+      return;
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      const reason = lastError.message.slice(0, 160);
+
+      if (emitted) {
+        // 已经吐出去内容了 → 重试会造成重复输出，只能如实报错
+        logger.warn(`[_stream_with_failover] ${candidate.label} 输出中途失败（不重试）：${reason}`);
+        throw lastError;
+      }
+      if (!candidate.isAux) {
+        // 主通道（链尾）失败 → 交给上层
+        throw lastError;
+      }
+      logger.warn(`[_stream_with_failover] ${candidate.label} 失败 → 尝试下一个候选：${reason}`);
     }
-    logger.debug(
-      `[chatglm] _stream_with_failover: yield chunk, content_len=${chunk.content?.length ?? 0}`,
-    );
-    yield [chunk, platform];
   }
 
-  if (emptyError !== null) {
-    // 让上层把真实原因返回给客户端，避免「空回复 + 无任何说明」
-    throw new PlatformUnavailableError(platform, `返回空内容: ${emptyError}`);
-  }
+  throw lastError ?? new PlatformUnavailableError(platform, '没有可用候选');
 }
 
 export { extractPlatformName };

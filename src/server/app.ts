@@ -26,6 +26,7 @@ import { getHistoryDb } from '../controllers/history-db.js';
 import { getModelRouter } from '../controllers/router.js';
 import { resetApiLog } from '../log/api-logger.js';
 import { removePidFileIfOwned, writePidFile } from './pidfile.js';
+import { startSessionRefreshLoop, stopSessionRefreshLoop } from './session-refresh.js';
 import { logger } from '../log/logger.js';
 import { ensureFirefox } from '../browser/ensure-firefox.js';
 import { disposeAllChannels, disposeSharedBrowser } from '../browser/manager.js';
@@ -292,6 +293,12 @@ export async function startServer(): Promise<number> {
   writePidFile(process.pid);
   logger.debug(`PID 文件已写入: ${process.pid}`);
 
+  /* 会话保鲜（2026-10-18 用户要求）：服务运行期间，后台另开一个浏览器，
+   * 每 24 小时把**未在使用**的已登录账号刷新一次（探测登录态 → 写回最新 cookie/token）。
+   * ⚠️ 正在被主/辅通道持有的账号一律跳过 —— 同一账号两处同时用会互相顶掉会话。
+   * 定时器随服务停止而终止（`shutdown` 里 stop）。 */
+  startSessionRefreshLoop({ isInUse: () => getModelRouter().getInUseAccounts() });
+
   // ===== 优雅关闭 =====
   const shutdown = async (signal: string): Promise<void> => {
     logger.info(`收到 ${signal}，正在关闭...`);
@@ -301,6 +308,7 @@ export async function startServer(): Promise<number> {
       logger.warn(`关闭 HTTP 服务失败: ${errorMessage(error)}`);
     }
     periodicCleanup?.stop();
+    stopSessionRefreshLoop();
     await waitForBackgroundTasks();
     try {
       await disposeAllChannels();

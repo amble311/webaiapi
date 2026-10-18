@@ -113,12 +113,40 @@ export function updateAuthBearer(
   authDir?: string,
 ): boolean {
   if (!bearer) return false;
+  return updateAuthRecord(platform, accountId, { bearer }, authDir);
+}
+
+
+/**
+ * 原子更新凭证里的若干字段（`bearer` / `cookies`），其余字段原样保留。
+ *
+ * 用途：① provider 把平台**轮换出的新 token** 写回（`updateAuthBearer` 委托到这里）；
+ * ② 会话保鲜任务刷新后把**最新 cookie** 写回（cookie 会过期，不刷新迟早失效）。
+ *
+ * @returns 是否真的写入（文件不存在 / 内容没变 → false）
+ */
+export function updateAuthRecord(
+  platform: string,
+  accountId: string,
+  patch: { bearer?: string; cookies?: CapturedCookie[] },
+  authDir?: string,
+): boolean {
   try {
     const file = authFilePath(platform, accountId, authDir);
     if (!existsSync(file)) return false;
     const auth = JSON.parse(readFileSync(file, 'utf8')) as AuthRecord;
-    if (String(auth.bearer ?? '') === bearer) return false;
-    auth.bearer = bearer;
+    let changed = false;
+
+    if (patch.bearer && String(auth.bearer ?? '') !== patch.bearer) {
+      auth.bearer = patch.bearer;
+      changed = true;
+    }
+    if (patch.cookies && patch.cookies.length > 0) {
+      auth.cookies = patch.cookies as AuthRecord['cookies'];
+      changed = true;
+    }
+    if (!changed) return false;
+
     const tmp = `${file}.tmp-${process.pid}`;
     writeFileSync(tmp, JSON.stringify(auth, null, 2), { encoding: 'utf8', mode: 0o600 });
     renameSync(tmp, file);

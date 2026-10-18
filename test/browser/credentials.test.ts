@@ -16,6 +16,7 @@ import {
   loadAuth,
   normalizeCookies,
   updateAuthBearer,
+  updateAuthRecord,
 } from '../../src/browser/credentials.js';
 import { extractAccountInfoSync } from '../../src/browser/platforms.js';
 
@@ -378,5 +379,60 @@ describe('updateAuthBearer', () => {
     writeFileSync(file, '{not json', 'utf8');
     expect(updateAuthBearer('deepseek', 'bad', 'X', dir)).toBe(false);
     expect(readFileSync(file, 'utf8')).toBe('{not json');
+  });
+});
+
+/**
+ * `updateAuthRecord` —— 会话保鲜任务用它把**最新 cookie**（以及 deepseek 的新 token）写回。
+ * cookie 会过期，不刷新迟早失效（2026-10-18「跑着跑着登录态失效」的背景）。
+ */
+describe('updateAuthRecord', () => {
+  const seed = (accountId: string, record: Record<string, unknown>): string => {
+    const file = authFilePath('deepseek', accountId, dir);
+    mkdirSync(join(dir, 'deepseek'), { recursive: true });
+    writeFileSync(file, JSON.stringify(record, null, 2), 'utf8');
+    return file;
+  };
+  const cookie = (name: string, value: string): CapturedCookie =>
+    ({ name, value, domain: '.deepseek.com', path: '/' }) as CapturedCookie;
+
+  it('⭐ 同时写回 bearer 与 cookies，其余字段不动', () => {
+    seed('rec1', {
+      bearer: 'OLD',
+      cookies: [cookie('a', '1')],
+      account_info: { label: '洛小北' },
+      captured_at: 111,
+    });
+
+    expect(
+      updateAuthRecord('deepseek', 'rec1', { bearer: 'NEW', cookies: [cookie('b', '2')] }, dir),
+    ).toBe(true);
+
+    const after = loadAuth('deepseek', { accountId: 'rec1', authDir: dir });
+    expect(after?.bearer).toBe('NEW');
+    expect((after?.cookies ?? []).map((c) => c.name)).toEqual(['b']);
+    expect(after?.account_info?.label).toBe('洛小北');
+    expect(after?.captured_at).toBe(111);
+  });
+
+  it('只给 cookies 时不会清掉 bearer', () => {
+    seed('rec2', { bearer: 'KEEP', cookies: [cookie('a', '1')] });
+    expect(updateAuthRecord('deepseek', 'rec2', { cookies: [cookie('z', '9')] }, dir)).toBe(true);
+    const after = loadAuth('deepseek', { accountId: 'rec2', authDir: dir });
+    expect(after?.bearer).toBe('KEEP');
+    expect((after?.cookies ?? []).map((c) => c.name)).toEqual(['z']);
+  });
+
+  it('空 patch / 文件不存在 → false（不抛）', () => {
+    seed('rec3', { bearer: 'X' });
+    expect(updateAuthRecord('deepseek', 'rec3', {}, dir)).toBe(false);
+    expect(updateAuthRecord('deepseek', 'nope', { bearer: 'Y' }, dir)).toBe(false);
+    expect(updateAuthRecord('deepseek', 'rec3', { cookies: [] }, dir)).toBe(false);
+  });
+
+  it('写入后权限仍是 0600', () => {
+    const file = seed('rec4', { bearer: 'A', cookies: [cookie('a', '1')] });
+    expect(updateAuthRecord('deepseek', 'rec4', { cookies: [cookie('b', '2')] }, dir)).toBe(true);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
   });
 });

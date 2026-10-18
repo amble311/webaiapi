@@ -110,3 +110,91 @@ describe('辅助通道：跨平台回落', () => {
     expect(text).toBe('main');
   });
 });
+
+/**
+ * ⭐ 2026-10-18 用户规则：**辅助通道逐级回落**
+ *
+ * ① 同平台副账号 → ② 其它平台的辅助通道 → ③ 主通道（共用，串行）。
+ * ⚠️ 但某候选**已经吐出内容**再失败时**不能重试**（会把回复吐两遍）。
+ */
+describe('辅助通道逐级回落（同平台 → 其它平台 → 主通道）', () => {
+  type Mode = 'ok' | 'fail' | 'partial-then-fail';
+
+  const provider = (platform: string, tag: string, seen: string[], mode: Mode = 'ok') => ({
+    platform,
+    getAccountId: () => `acc-${tag}`,
+    async *chatStream(_r: ChatRequest): AsyncGenerator<{ content?: string; error?: string }> {
+      seen.push(tag);
+      if (mode === 'fail') throw new Error(`${tag} 挂了`);
+      if (mode === 'partial-then-fail') {
+        yield { content: '半句' };
+        throw new Error(`${tag} 中途挂了`);
+      }
+      yield { content: tag };
+    },
+  });
+
+  const router = (main: ReturnType<typeof provider>, aux: Array<[string, ReturnType<typeof provider>, number]>) =>
+    ({
+      getProvider: async () => main,
+      getAuxCandidates: () => aux,
+      noteMainPlatform: () => undefined,
+      platformOfModel: () => 'chatglm',
+    }) as unknown as ModelRouter;
+
+  const run = async (r: ModelRouter): Promise<string[]> => {
+    const out: string[] = [];
+    for await (const [chunk] of streamWithFailover(r, 'chatglm', {
+      message: '把这段历史压成摘要',
+      stream: true,
+      tools: [],
+      context: { use_aux_page: true },
+    } as unknown as ChatRequest, {} as unknown as HistoryDB)) {
+      if (chunk.content) out.push(chunk.content);
+    }
+    return out;
+  };
+
+  it('⭐ 同平台辅助通道失败 → 换其它平台的辅助通道', async () => {
+    const seen: string[] = [];
+    const main = provider('chatglm-browser', 'main', seen);
+    const same = provider('chatglm-browser', 'aux-same', seen, 'fail');
+    const other = provider('deepseek-browser', 'aux-other', seen);
+
+    const out = await run(
+      router(main, [
+        ['chatglm', same, 1],
+        ['deepseek', other, 1],
+      ]),
+    );
+
+    expect(seen).toEqual(['aux-same', 'aux-other']); // 先同平台、失败后换平台
+    expect(out.join('')).toBe('aux-other');
+  });
+
+  it('⭐ 所有辅助通道都失败 → 回落主通道（共用，串行）', async () => {
+    const seen: string[] = [];
+    const main = provider('chatglm-browser', 'main', seen);
+    const same = provider('chatglm-browser', 'aux-same', seen, 'fail');
+    const other = provider('deepseek-browser', 'aux-other', seen, 'fail');
+
+    const out = await run(
+      router(main, [
+        ['chatglm', same, 1],
+        ['deepseek', other, 1],
+      ]),
+    );
+
+    expect(seen).toEqual(['aux-same', 'aux-other', 'main']);
+    expect(out.join('')).toBe('main');
+  });
+
+  it('⭐ 某个候选已经吐过内容再失败 → **不重试**（避免回复吐两遍）', async () => {
+    const seen: string[] = [];
+    const main = provider('chatglm-browser', 'main', seen);
+    const partial = provider('chatglm-browser', 'aux-partial', seen, 'partial-then-fail');
+
+    await expect(run(router(main, [['chatglm', partial, 1]]))).rejects.toThrow(/中途挂了/);
+    expect(seen).toEqual(['aux-partial']); // 没有去试主通道
+  });
+});
