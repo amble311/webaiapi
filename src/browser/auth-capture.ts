@@ -20,10 +20,22 @@
  */
 import { copyFileSync, existsSync, mkdirSync, renameSync, writeFileSync, chmodSync } from 'node:fs';
 
-import { firefox, type Browser, type BrowserContext, type Page, type Request } from 'playwright';
+import {
+  chromium,
+  firefox,
+  type Browser,
+  type BrowserContext,
+  type Page,
+  type Request,
+} from 'playwright';
 
+import { expandHome, settings } from '../config.js';
 import { logger } from '../log/logger.js';
-import { parseDeepseekUserInfo, platformDisplayName } from './platforms.js';
+import {
+  filterCookiesForPlatform,
+  parseDeepseekUserInfo,
+  platformDisplayName,
+} from './platforms.js';
 import { STEALTH_JS } from './stealth.js';
 import { classifyLoginState, initTokenJs, probeSessionJs } from './deepseek-session.js';
 import { isInteractive } from '../utils/prompt.js';
@@ -139,6 +151,11 @@ export async function fetchAccountInfo(
   let apiUrl: string | null = null;
   if (platform === 'deepseek') {
     apiUrl = 'https://chat.deepseek.com/api/v0/users/current';
+  } else if (platform === 'chatgpt') {
+    /* ChatGPT 的登录态是 session cookie；`/api/auth/session` 返回
+     * `{ user: { id, name, email }, accessToken, expires }` —— 身份取 `user.id`，
+     * 标签优先 name / email（否则只有不透明 cookie，拿不到用户名）。 */
+    apiUrl = 'https://chatgpt.com/api/auth/session';
   } else if (platform === 'kimi') {
     apiUrl = `https://www.kimi.com/api/user?t=${Date.now()}`;
     headers['Referer'] ??= 'https://www.kimi.com/';
@@ -159,7 +176,15 @@ export async function fetchAccountInfo(
       pageHeaders[k] = v;
     }
     try {
-      const inPage = await evaluateFn<unknown>(
+      /* ⚠️ 登录刚完成时页面正在导航 → 页面内 evaluate 会抛
+       * 「Execution context was destroyed, most likely because of a navigation」（2026-10-19 实测：
+       * ChatGPT 登录成功后立刻跳转，第一次就撞上 → 身份退回 `chatgpt:xxx`、拿不到邮箱）。
+       * 所以这里重试 3 次（每次等 1.5s 让导航稳定）。 */
+      let inPage: unknown = null;
+      let lastError: unknown = null;
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        try {
+          inPage = await evaluateFn<unknown>(
         page,
         `async () => {
     try {
@@ -175,6 +200,19 @@ export async function fetchAccountInfo(
     }
   }`,
       );
+          break;
+        } catch (error) {
+          lastError = error;
+          if (attempt === 3) break;
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+        }
+      }
+      if (!inPage && lastError) {
+        logger.warn(
+          `[${platform}] 页面内取用户信息重试 3 次仍失败（${String(lastError).slice(0, 120)}）→ 改走 Node 直连`,
+        );
+      }
+
       const rec = (inPage ?? {}) as Record<string, unknown>;
       if (rec['__waiapi_status']) {
         logger.warn(
@@ -213,7 +251,22 @@ export async function fetchAccountInfo(
       const data = (await resp.json()) as Record<string, unknown>;
       logger.info(`[${platform}] 获取到 user info: ${JSON.stringify(data).slice(0, 200)}`);
 
-      if (platform === 'deepseek') {
+      if (platform === 'chatgpt') {
+        /* 形状：`{ user: { id, name, email }, accessToken, expires }` */
+        const user = (data['user'] ?? {}) as Record<string, unknown>;
+        const email = String(user['email'] ?? '');
+        const name = String(user['name'] ?? '');
+        const userId = String(user['id'] ?? '');
+        if (email) info['email'] = email;
+        if (name) info['name'] = name;
+        if (userId) {
+          info['user_id'] = userId;
+          info['identifier'] = userId;
+        }
+        if (name) info['label'] = name;
+        else if (email) info['label'] = email;
+        else if (userId) info['label'] = `ChatGPT ${userId.slice(0, 8)}`;
+      } else if (platform === 'deepseek') {
         // 解析逻辑抽成纯函数（可单测），并**用 user id 当稳定身份**而不是 session cookie
         Object.assign(info, parseDeepseekUserInfo(data));
       } else if (platform === 'kimi') {
@@ -389,8 +442,84 @@ export class AuthCapture {
 
     try {
       logger.info('启动 Firefox 浏览器...');
-      this.browser = await firefox.launch({ headless: this.headless });
-      this.context = await this.browser.newContext();
+      /* ===== 浏览器档案的选择（2026-10-19 用户要求）=====
+       * 背景：ChatGPT 走 **Google 登录** —— 每次都开空白浏览器，就等于每次都要先登 Google ✗。
+       * 三档，优先级从高到低：
+       *   ① `BROWSER_CDP_ENDPOINT`：直连**用户已安装的 Chrome**（CDP）→ 用它现成的 profile
+       *      与登录态（Google 等），完全不用重登；
+       *   ② `BROWSER_PROFILE_DIR`（默认开）：**持久化档案** → 登录态跨启动保留；
+       *   ③ 空字符串：每次开空白档案（旧行为）。 */
+      const cdpEndpoint = String(settings.browserCdpEndpoint ?? '').trim();
+      const profileDirRaw = String(settings.browserProfileDir ?? '').trim();
+      /* ⚠️ 默认 **Firefox**（2026-10-19 实测）：Cloudflare Turnstile 只放行 Firefox 路径；
+       * Chromium（Playwright 驱动）即使去掉自动化标记也会被判定，ChatGPT 登录过不了验证 ✗。 */
+      const useFirefox = String(settings.loginBrowser ?? 'firefox').trim().toLowerCase() !== 'chrome';
+
+      if (cdpEndpoint) {
+        logger.info(`连接已安装的 Chrome（CDP）: ${cdpEndpoint}（直接复用它的登录态）`);
+        this.browser = await chromium.connectOverCDP(cdpEndpoint);
+        /* 复用它已有的 context；没有就新建。⚠️ 不要动用户正在看的标签页 —— 下面另开一个新页。 */
+        this.context = this.browser.contexts()[0] ?? (await this.browser.newContext());
+      } else if (useFirefox) {
+        /* Firefox + 空白 context（= 2026-10-19 之前一直在用、且能过 Cloudflare 的路径）。
+         * ⚠️ Firefox 的档案**存不住 cookie**（实测），所以这里不做持久化，
+         * 也就不用 `BROWSER_PROFILE_DIR`（只有 `LOGIN_BROWSER=chrome` 时才用它）。 */
+        logger.info(
+          '使用 Firefox 登录（默认；能过 Cloudflare Turnstile）。' +
+            (profileDirRaw ? '持久化档案仅对 LOGIN_BROWSER=chrome 生效。' : ''),
+        );
+        this.browser = await firefox.launch({ headless: this.headless });
+        this.context = await this.browser.newContext();
+      } else if (profileDirRaw) {
+        const profileDir = expandHome(profileDirRaw);
+        try {
+          mkdirSync(profileDir, { recursive: true });
+          logger.info(`使用持久化浏览器档案（Google 等登录态会保留）: ${profileDir}`);
+          /* ⚠️ 用 **Chromium** 而不是 Firefox（2026-10-19 实测）：
+           * Firefox 的持久化档案**存不住 cookie**（重开就丢 ✗，只保住 localStorage）；
+           * Chromium profile 的 cookie 与 localStorage 都能保留（实测：页面/服务端写的 cookie 重启后仍在 ✓）。
+           * 优先用**系统已装的 Google Chrome**（`channel: 'chrome'`）：真实浏览器登录 Google 更顺，
+           * 也不需要额外下载 Playwright 内核；装不上再退回自带 Chromium。 */
+          /* ⚠️ Cloudflare / Turnstile（2026-10-19 用户实测「过不了真人验证」）：
+           * Playwright 默认会给 Chrome 加 `--enable-automation` 并开启
+           * `AutomationControlled` 特性 —— 这两样是 Turnstile 最典型的判据。
+           * 下面去掉它们，再补几个让实例更像「普通 Chrome」的参数。 */
+          const stealthArgs = [
+            '--disable-blink-features=AutomationControlled',
+            '--no-first-run',
+            '--no-default-browser-check',
+            '--disable-background-timer-throttling',
+            '--disable-renderer-backgrounding',
+          ];
+          try {
+            this.context = await chromium.launchPersistentContext(profileDir, {
+              channel: 'chrome',
+              headless: this.headless,
+              ignoreDefaultArgs: ['--enable-automation'],
+              args: stealthArgs,
+            });
+          } catch (chromeError) {
+            logger.warn(
+              `系统 Chrome 启动失败（${String(chromeError).slice(0, 100)}）→ 退回 Playwright 自带 Chromium`,
+            );
+            this.context = await chromium.launchPersistentContext(profileDir, {
+              headless: this.headless,
+            });
+          }
+          this.browser = this.context.browser();
+        } catch (error) {
+          /* ⚠️ 不要静默退回空白档案 —— 那会丢掉登录态，用户会以为"又要重登"是随机现象。
+           * 常见原因：上一次的登录浏览器没关干净 → 档案仍被占用。 */
+          throw new Error(
+            `打开持久化浏览器档案失败: ${String(error).slice(0, 160)}。` +
+              '通常是上一次的登录浏览器没关干净（档案被占用）→ 关掉残留的 Firefox 窗口后重试；' +
+              '也可以用 BROWSER_PROFILE_DIR= 临时走空白档案。',
+          );
+        }
+      } else {
+        this.browser = await firefox.launch({ headless: this.headless });
+        this.context = await this.browser.newContext();
+      }
       this.page = await this.context.newPage();
 
       /* ⚠️ 登录页也必须注入 STEALTH（2026-10-16 实测）：
@@ -497,7 +626,33 @@ export class AuthCapture {
       );
 
       await this.captureCookiesAndUa();
-      logger.info(`✓ 已捕获 ${this.capturedAuth.cookies?.length ?? 0} 个 cookies`);
+
+      /* ⚠️ 只留**平台相关**的 cookie（2026-10-19 实测：ChatGPT 走 Google 登录会把 34 个
+       * Google/YouTube cookie 一起捕获 → 隐私风险 + 噪音；provider 也用不到）。 */
+      const beforeCount = this.capturedAuth.cookies?.length ?? 0;
+      this.capturedAuth.cookies = filterCookiesForPlatform(
+        this.capturedAuth.cookies ?? [],
+        this.platform,
+      );
+      const afterCount = this.capturedAuth.cookies.length;
+      if (beforeCount !== afterCount) {
+        logger.info(
+          `  已过滤 ${beforeCount - afterCount} 个与 ${this.platform} 无关的 cookie` +
+            '（例如同一浏览器里的 Google 账号 cookie）',
+        );
+        this.capturedAuth.cookie_str = this.capturedAuth.cookies
+          .map((c) => `${c.name}=${c.value}`)
+          .join('; ');
+      }
+      logger.info(`✓ 已捕获 ${afterCount} 个 cookies`);
+      /* 打印 cookie **名字**（不含值）：登录类问题（尤其 ChatGPT 的 session-token 分片命名）
+       * 光看「捕获了 N 个」是查不出来的（2026-10-19 实测：登录成功却没落盘）。 */
+      logger.info(
+        `  cookie 名: ${(this.capturedAuth.cookies ?? [])
+          .map((c) => c.name)
+          .slice(0, 20)
+          .join(', ')}`,
+      );
 
       if (this.capturedAuth.bearer) {
         logger.info('✓ 已捕获 bearer token');

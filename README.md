@@ -2,13 +2,29 @@
 
 **中文** | [English](https://github.com/amble311/webaiapi/blob/main/README.en.md)
 
-把 AI 聊天网页（目前支持 **ChatGLM / 智谱清言** 与 **DeepSeek**）包装成 **OpenAI 兼容 API**。
+把 AI 聊天网页（**ChatGLM / 智谱清言**、**DeepSeek**、**ChatGPT**）包装成 **OpenAI 兼容 API**。
 纯浏览器自动化（Playwright Firefox），**不需要 API Key、不需要逆向签名**——你只要在浏览器里登录一次。
 
 用它可以在任何支持 OpenAI 协议的客户端（CodeBuddy、Trae、Cursor、各类 SDK）里，
 直接使用你的网页端账号额度。
 
 ---
+## 快速上手
+```bash
+npm i -g webaiapi
+webaiapi login # 按照提示登录平台账号，建议两个号以上
+```
+```bash
+webaiapi start
+```
+在agent中的调用配置如下：
+模型地址：http://0.0.0.0:8631/v1
+模型ID: mix, chatglm, deepseek #mix为自动选择可用平台，其余为指定使用该平台的模型。
+apikey: 随便填，不校验
+上下文输入：64K（65536）
+上下文输出：64K（65536）
+上述设置如需修改，请在.env文件中修改。
+
 
 ## 安装
 
@@ -99,9 +115,17 @@ webaiapi logout chatglm --account acc2 --yes
 
 | 模型名 | 说明 |
 |---|---|
-| `mix` | 自动选择可用平台（当前即 chatglm） |
+| `mix` | 自动按平台顺序故障转移（chatglm → deepseek → chatgpt） |
 | `chatglm` | 平台名模型，只跨账号、不跨平台 |
+| `deepseek` | 同上（DeepSeek 网页版） |
+| `chatgpt` | 同上（ChatGPT 网页版）⚠️ 见下方网络要求 |
 | `glm-4` / `glm-3` | ChatGLM 的具体模型别名 |
+
+> ⚠️ **`chatgpt` 需要能正常访问 `chatgpt.com` 的网络环境**（一般要代理/VPN）：
+> - 浏览器的出口必须能打开 `chatgpt.com`（Cloudflare / 风控对机房 IP 很敏感）；
+> - 登录用 **Firefox**（`LOGIN_BROWSER=firefox`，默认）—— 实测 Chromium/Playwright 过不了 Cloudflare 真人验证 ✗；
+> - **首次请求要等页面水合**（约 30~90s，算在 `REQUEST_TIMEOUT` 里），之后同一进程内会快；
+> - 目前是**整段返回**（不逐字流式），先保证内容完整。
 
 ## 多账号（可选，但推荐）
 

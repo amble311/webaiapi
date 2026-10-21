@@ -52,6 +52,35 @@ export interface Settings {
   toolStallRounds: number;
 
   /**
+   * 登录用哪个浏览器内核：`firefox`（默认）或 `chrome`。
+   *
+   * ⚠️ 2026-10-19 实测结论：**Cloudflare Turnstile 只放行 Firefox 路径** ——
+   * Chromium 即便去掉 `--enable-automation` / `AutomationControlled` 仍被判定为自动化，
+   * ChatGPT（经 Cloudflare）的登录**过不了真人验证**；切回 Firefox 就正常（用户实测：
+   * 换持久化档案之前一直能登，换了之后过不了）。
+   * 所以默认 `firefox`；`chrome` 仅在需要**持久化档案**（保住 Google 登录态）且目标站点
+   * 没有 Cloudflare 时才值得开。
+   */
+  loginBrowser: string;
+
+  /**
+   * 交互流程（`webaiapi login` 等）使用的**持久化浏览器档案**目录。
+   *
+   * ⚠️ 为什么需要（2026-10-19 用户实测）：ChatGPT 走 **Google 登录** —— 每次都开**空白**
+   * 浏览器就等于每次都要先登 Google，再登 ChatGPT ✗。持久化档案把这些登录态保留下来，
+   * 一次登录长期有效。空字符串 = 每次都开空白档案（旧行为）。
+   */
+  browserProfileDir: string;
+
+  /**
+   * 连**用户已安装的 Chrome** 做登录（CDP 端点，如 `http://127.0.0.1:9222`）。
+   *
+   * 给了就直接用它现有的 profile（里面已有 Google/各平台登录态），**完全不用重登**。
+   * ⚠️ 需要用户以 `--remote-debugging-port=9222` 启动 Chrome。空字符串 = 不连。
+   */
+  browserCdpEndpoint: string;
+
+  /**
    * 应急上限：单次请求最多多少轮工具调用（只防真无限，正常任务碰不到）。默认 150。
    *
    * ⚠️ 这是**最后一道保险**，不是常规判据 —— 常规由 `toolStallRounds` 管。
@@ -85,6 +114,9 @@ const ENV_KEYS: Record<string, keyof Settings> = {
   AVAILABLE_MODELS: 'availableModels',
   TOOL_STALL_ROUNDS: 'toolStallRounds',
   TOOL_ROUND_HARD_LIMIT: 'toolRoundHardLimit',
+  LOGIN_BROWSER: 'loginBrowser',
+  BROWSER_PROFILE_DIR: 'browserProfileDir',
+  BROWSER_CDP_ENDPOINT: 'browserCdpEndpoint',
   API_KEYS: 'apiKeys',
   API_KEY_REQUIRED: 'apiKeyRequired',
   RATE_LIMIT_PER_MINUTE: 'rateLimitPerMinute',
@@ -132,6 +164,9 @@ const DEFAULTS: Settings = {
   availableModels: 'mix',
   toolStallRounds: 3,
   toolRoundHardLimit: 150,
+  loginBrowser: 'firefox',
+  browserProfileDir: '~/.ai-api/browser/login-profile',
+  browserCdpEndpoint: '',
   apiKeys: '',
   apiKeyRequired: false,
   rateLimitPerMinute: 60,

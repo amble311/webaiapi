@@ -107,6 +107,15 @@ export const SSE_CAPTURE_JS = `
 
   // 只关心「可能承载对话内容」的请求，避免把静态资源也抓下来
   const _looksLikeStream = (ct, url) => {
+    try {
+      /* ⚠️ 平台可设 window.__glmSSEUrlFilter（子串）：只记这个 URL 的流。
+       * 2026-10-19 实测（ChatGPT）：页面同时推多个 backend-api 流，
+       * 不过滤时正文会被后一个流覆盖 → 只拿到开头一两个字。 */
+      const filter = window.__glmSSEUrlFilter;
+      if (typeof filter === 'string' && filter.length > 0) {
+        return String(url || '').indexOf(filter) >= 0;
+      }
+    } catch (e) {}
     ct = (ct || '').toLowerCase();
     url = url || '';
     if (ct.indexOf('event-stream') >= 0) return true;

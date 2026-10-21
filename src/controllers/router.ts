@@ -37,6 +37,7 @@ import { logger } from '../log/logger.js';
 import { getAvailableModelsList } from '../config.js';
 import { ChatGLMBrowserProvider } from '../providers/chatglm.js';
 import { DeepSeekBrowserProvider } from '../providers/deepseek.js';
+import { ChatGptBrowserProvider } from '../providers/chatgpt.js';
 import { type BaseProvider } from '../providers/base.js';
 import { ModelNotFoundError, PlatformUnavailableError } from '../utils/errors.js';
 
@@ -88,6 +89,7 @@ const PROVIDER_FACTORIES: Record<
 > = {
   chatglm: (accountId, channelKey) => new ChatGLMBrowserProvider({ accountId, channelKey }),
   deepseek: (accountId, channelKey) => new DeepSeekBrowserProvider({ accountId, channelKey }),
+  chatgpt: (accountId, channelKey) => new ChatGptBrowserProvider({ accountId, channelKey }),
 };
 
 /**

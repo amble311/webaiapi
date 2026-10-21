@@ -595,6 +595,14 @@ async function loginOnPlatform(ctx: {
   if (strength === 'session' || strength === 'unknown') {
     console.log('');
     console.log(`${bold('✗ 只抓到匿名会话凭证，没有写入任何文件。')}`);
+    const hint = String(capture.capturedAuth?.account_info?.identifier ?? '').trim();
+    const cookieNames = (capture.capturedAuth?.cookies ?? [])
+      .map((c) => c.name)
+      .slice(0, 12);
+    console.log(
+      `  身份判定: ${strength}${hint ? ` / ${hint}` : ''}` +
+        `；cookie: ${cookieNames.length > 0 ? cookieNames.join(', ') : '(无)'}`,
+    );
     console.log(
       `  ${spec.displayName} 对**未登录的访客**也会下发会话 cookie/token ——` +
         '所以「页面打开完成」不等于「你已经登录」。',

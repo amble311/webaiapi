@@ -9,6 +9,7 @@ import {
   PLATFORM_NAMES,
   PLATFORMS_WITH_PROVIDER,
   extractAccountInfoSync,
+  filterCookiesForPlatform,
   identityStrength,
   isKnownPlatform,
   parseDeepseekUserInfo,
@@ -274,5 +275,134 @@ describe('extractAccountInfoSync(deepseek) 身份优先级', () => {
     const info = extractAccountInfoSync('deepseek', auth);
     expect(info['label']).toBe('session:abc123456789');
     expect(identityStrength('deepseek', auth)).toBe('session');
+  });
+});
+
+/**
+ * ChatGPT 平台注册（2026-10-19 用户要求「加 chatgpt，放在第三位；先能登录，再探索配置」）。
+ *
+ * ⚠️ 关键：**未登录时必须判 unknown**（不能像当年的 deepseek 游客那样"打开页面就算成功"）；
+ * 有 session cookie 才算登录；身份优先用 `/api/auth/session` 写回的 user id / email。
+ */
+describe('chatgpt 平台', () => {
+  const cookie = (name: string, value: string) => ({ name, value, domain: '.chatgpt.com', path: '/' });
+
+  it('⭐ 排在第三位（chatglm → deepseek → chatgpt）', () => {
+    expect(PLATFORM_IDS.indexOf('chatgpt')).toBe(2);
+    expect(PLATFORM_IDS.slice(0, 3)).toEqual(['chatglm', 'deepseek', 'chatgpt']);
+  });
+
+  it('登录入口与「对话已实现」声明（2026-10-19 起 provider 就绪）', () => {
+    const spec = PLATFORMS['chatgpt'];
+    expect(spec?.loginUrl).toBe('https://chatgpt.com/');
+    expect(spec?.providerImplemented).toBe(true);
+    // 已实现对话 → 出现在 PLATFORM_MODEL_NAMES（/v1/models 的可用模型，名字就是 chatgpt）
+    expect(PLATFORMS_WITH_PROVIDER).toContain('chatgpt');
+  });
+
+  it('⭐ 游客（没有 session cookie）→ unknown（不会把"只打开登录页"当成功）', () => {
+    const guest = { cookies: [cookie('oai-did', 'abc'), cookie('__cf_bm', 'x')] } as unknown as Parameters<
+      typeof extractAccountInfoSync
+    >[1];
+    expect(identityStrength('chatgpt', guest)).toBe('unknown');
+    expect(extractAccountInfoSync('chatgpt', guest)['identifier']).toBe('unknown');
+  });
+
+  it('有 session cookie → 算登录（token 级），身份用 cookie 前缀占位', () => {
+    const logged = {
+      cookies: [cookie('__Secure-next-auth.session-token', 'eyJhbGciOiJ…xyz')],
+    } as unknown as Parameters<typeof extractAccountInfoSync>[1];
+    const info = extractAccountInfoSync('chatgpt', logged);
+    expect(identityStrength('chatgpt', logged)).toBe('token');
+    expect(String(info['identifier'])).toMatch(/^chatgpt:/);
+    expect(String(info['label'])).not.toContain('session:'); // 否则会被判成游客
+  });
+
+  it('⭐⭐ session-token 被分片（`.0` / `.1`）也算登录 —— 2026-10-19 实测「登录成功却没保存凭证」', () => {
+    // next-auth/Auth.js 在 token 较大时会分片成多条 cookie；精确名字匹配会全部落空 → 判成游客 → 拒绝落盘
+    const chunked = {
+      cookies: [
+        cookie('__Secure-next-auth.session-token.0', 'eyJhbGciOiJSUzI1NiJ9'),
+        cookie('__Secure-next-auth.session-token.1', 'payload-part-2'),
+        cookie('oai-did', 'abc'),
+      ],
+    } as unknown as Parameters<typeof extractAccountInfoSync>[1];
+
+    expect(identityStrength('chatgpt', chunked)).toBe('token');
+    expect(String(extractAccountInfoSync('chatgpt', chunked)['identifier'])).toMatch(/^chatgpt:/);
+  });
+
+  it('authjs 命名（`__Secure-authjs.session-token`）也认', () => {
+    const authjs = {
+      cookies: [cookie('__Secure-authjs.session-token', 'tok')],
+    } as unknown as Parameters<typeof extractAccountInfoSync>[1];
+    expect(identityStrength('chatgpt', authjs)).toBe('token');
+  });
+
+  it('⭐ 已落盘的 API 身份优先（user id + 邮箱 → 直接显示邮箱）', () => {
+    const auth = {
+      cookies: [cookie('__Secure-next-auth.session-token', 'x')],
+      account_info: {
+        user_id: 'user-abc123',
+        identifier: 'user-abc123',
+        email: 'me@example.com',
+        label: 'me@example.com',
+      },
+    } as unknown as Parameters<typeof extractAccountInfoSync>[1];
+    const info = extractAccountInfoSync('chatgpt', auth);
+    expect(info['identifier']).toBe('user-abc123');
+    expect(info['label']).toBe('me@example.com');
+    expect(identityStrength('chatgpt', auth)).toBe('token');
+  });
+});
+
+/**
+ * ⭐ 只保留**平台相关**的 cookie（2026-10-19 实测）。
+ *
+ * ChatGPT 走 Google 登录时，同一个 context 里会产生 34 个 Google/YouTube cookie
+ * （`SID` / `HSID` / `__Secure-1PSID` / `.youtube.com` …）——
+ * 全存进凭证既是**隐私风险**（把用户的 Google 会话写进我们的文件），也是噪音。
+ */
+describe('filterCookiesForPlatform', () => {
+  const c = (name: string, domain: string) => ({ name, domain, value: 'v' });
+
+  it('⭐ 去掉同一浏览器里的 Google / YouTube cookie，保留平台自身的', () => {
+    const cookies = [
+      c('__Secure-next-auth.session-token.0', '.chatgpt.com'),
+      c('__Secure-next-auth.session-token.1', 'chatgpt.com'),
+      c('oai-did', '.chatgpt.com'),
+      c('SID', '.google.com'),
+      c('HSID', '.google.com.sg'),
+      c('__Secure-1PSID', 'accounts.google.com'),
+      c('VISITOR_INFO1_LIVE', '.youtube.com'),
+      c('__cf_bm', '.cloudflare.com'),
+    ];
+
+    const kept = filterCookiesForPlatform(cookies, 'chatgpt');
+    expect(kept.map((x) => x.name).sort()).toEqual([
+      '__Secure-next-auth.session-token.0',
+      '__Secure-next-auth.session-token.1',
+      'oai-did',
+    ]);
+  });
+
+  it('同平台的其它域名（auth.openai.com）也保留', () => {
+    const kept = filterCookiesForPlatform(
+      [c('a', 'auth.openai.com'), c('b', '.openai.com'), c('c', '.example.com')],
+      'chatgpt',
+    );
+    expect(kept.map((x) => x.name)).toEqual(['a', 'b']);
+  });
+
+  it('deepseek 只留 deepseek.com（父域匹配）', () => {
+    const kept = filterCookiesForPlatform(
+      [c('ds_session_id', '.deepseek.com'), c('HWWAFSESID', 'chat.deepseek.com'), c('x', '.google.com')],
+      'deepseek',
+    );
+    expect(kept.map((x) => x.name)).toEqual(['ds_session_id', 'HWWAFSESID']);
+  });
+
+  it('没有 domain 的 cookie 会被丢掉（不能判断归属）', () => {
+    expect(filterCookiesForPlatform([{ name: 'n', value: 'v' }], 'chatgpt')).toEqual([]);
   });
 });

@@ -80,6 +80,44 @@ function str(value: unknown): string {
   return typeof value === 'string' ? value : value == null ? '' : String(value);
 }
 
+/**
+ * ChatGPT：优先用**已落盘的 API 身份**（`user.id` / email），否则看 session cookie。
+ *
+ * ⚠️ 没有 session cookie 时必须返回**空对象** → `identityStrength` 判 `unknown`
+ * → 登录流程**不会**把「只打开登录页」当成功（deepseek 的游客事故同理）。
+ */
+function extractChatgpt(auth: AuthRecord): AccountInfo {
+  const info: AccountInfo = {};
+  const persisted = (auth.account_info ?? {}) as AccountInfo;
+
+  const persistedId = str(persisted['user_id']) || str(persisted['identifier']);
+  if (persistedId && !persistedId.startsWith('session:') && !persistedId.startsWith('chatgpt:')) {
+    info['identifier'] = persistedId;
+    if (persisted['label']) info['label'] = str(persisted['label']);
+    if (persisted['name']) info['name'] = str(persisted['name']);
+    if (persisted['email']) info['email'] = str(persisted['email']);
+    return info;
+  }
+
+  /* ⚠️ 必须按「名字里含 session-token」匹配，不能只认精确名字（2026-10-19 实测）：
+   * next-auth/Auth.js 在 token 较大时会把它**分片**成 `.0` / `.1` / `.2` 多条 cookie，
+   * 精确匹配会全部落空 → 判成"未登录" → 登录流程拒绝落盘（用户报「登录成功但没保存凭证」）。 */
+  const cookieValues = (auth.cookies ?? [])
+    .filter((c) => /session-?token/i.test(String(c?.name ?? '')))
+    .map((c) => String(c?.value ?? ''))
+    .filter(Boolean);
+  const cookie = cookieValues.length > 0 ? cookieValues.join('') : '';
+  /* 没登录（游客）→ 返回空对象，让 `identityStrength` 判 unknown。
+   * cookie 名字的排查信息由 `AuthCapture` 在捕获时统一打印（本模块保持纯函数、无日志依赖）。 */
+  if (!cookie) return info;
+
+  /* 有 session cookie = 已登录，但拿不到邮箱（cookie 不透明）→ 用 cookie 前缀当临时身份。
+   * ⚠️ 标签里**不要**出现 `session:` 前缀 —— `identityStrength` 会把它当游客。 */
+  info['identifier'] = `chatgpt:${cookie.slice(0, 12)}`;
+  info['label'] = 'ChatGPT 账号（未取到邮箱）';
+  return info;
+}
+
 /** ChatGLM：bearer 是 JWT，含 `sub`（用户名）与 `uid`。 */
 function extractChatglm(auth: AuthRecord): AccountInfo {
   const info: AccountInfo = {};
@@ -380,6 +418,24 @@ export const PLATFORM_LIST: readonly PlatformSpec[] = [
     extractIdentity: extractDeepseek,
   },
   {
+    /* ⚠️ 2026-10-19 加（用户要求放在第三位）。目前**只做登录与身份**：
+     * `providerImplemented: false` → 不出现在 `/v1/models` 的可用模型里，
+     * 只在 `webaiapi model` 的「平台状态」里显示「未登录 / 对话 ❌」。
+     * 等对话 Provider 写好，把这里翻成 true 即可（工厂表也要加）。 */
+    id: 'chatgpt',
+    displayName: 'ChatGPT (OpenAI)',
+    loginUrl: 'https://chatgpt.com/',
+    apiPattern: {
+      /* 对话走 `backend-api/conversation`；认证靠**cookie**（不是 Authorization 头）。 */
+      urlPattern: 'chatgpt.com/backend-api/',
+      authHeader: '',
+      authPrefix: '',
+      cookieOnly: true,
+    },
+    providerImplemented: true,
+    extractIdentity: extractChatgpt,
+  },
+  {
     id: 'qianwen',
     displayName: '通义千问',
     loginUrl: 'https://www.qianwen.com/',
@@ -421,6 +477,58 @@ export const PLATFORM_LIST: readonly PlatformSpec[] = [
 export const PLATFORMS: Record<string, PlatformSpec> = Object.fromEntries(
   PLATFORM_LIST.map((spec) => [spec.id, spec]),
 );
+
+/**
+ * 平台相关的 cookie 域名（登录 URL 的域名 + 同族域名）。
+ *
+ * ⚠️ 用**后缀匹配**（`chat.deepseek.com` → `deepseek.com`）：同一平台常跨子域设 cookie。
+ */
+export function platformCookieDomains(platform: string): string[] {
+  const extra: Record<string, string[]> = {
+    chatgpt: ['chatgpt.com', 'openai.com'],
+    deepseek: ['deepseek.com'],
+    chatglm: ['chatglm.cn'],
+    kimi: ['kimi.com', 'moonshot.cn'],
+    qianwen: ['qianwen.com', 'aliyun.com'],
+    doubao: ['doubao.com', 'volcengine.com'],
+    zhipu: ['z.ai', 'bigmodel.cn'],
+  };
+
+  const out = new Set<string>();
+  try {
+    const host = new URL(PLATFORM_LOGIN_URLS[platform] ?? '').hostname.toLowerCase();
+    if (host) {
+      out.add(host.replace(/^www\./, ''));
+      const parts = host.split('.');
+      if (parts.length >= 2) out.add(parts.slice(-2).join('.')); // 父域
+    }
+  } catch {
+    // 没有登录 URL 就只靠 extra
+  }
+  for (const domain of extra[platform] ?? []) out.add(domain);
+  return [...out];
+}
+
+/**
+ * 只保留**与平台相关**的 cookie。
+ *
+ * ⚠️⚠️ 2026-10-19 实测（ChatGPT 走 Google 登录）：同一个 context 里会产生 **34 个
+ * Google/YouTube cookie**（`SID` / `HSID` / `__Secure-1PSID` …）——
+ * 全部存进凭证既是**隐私风险**（把用户的 Google 账号会话写到我们文件里），
+ * 也是噪音（我们的 provider 用不到）。按域名后缀过滤掉。
+ */
+export function filterCookiesForPlatform<T extends { domain?: string }>(
+  cookies: T[],
+  platform: string,
+): T[] {
+  const domains = platformCookieDomains(platform);
+  if (domains.length === 0) return cookies;
+  return cookies.filter((cookie) => {
+    const domain = String(cookie?.domain ?? '').replace(/^\./, '').toLowerCase();
+    if (!domain) return false;
+    return domains.some((allowed) => domain === allowed || domain.endsWith(`.${allowed}`));
+  });
+}
 
 /** 全部平台 id（按 {@link PLATFORM_LIST} 顺序）。 */
 export const PLATFORM_IDS: string[] = PLATFORM_LIST.map((spec) => spec.id);

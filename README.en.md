@@ -102,8 +102,10 @@ webaiapi logout chatglm --account acc2 --yes
 
 | Model | Description |
 |---|---|
-| `mix` | Pick any available platform automatically (currently chatglm) |
+| `mix` | Fail over across platforms automatically (chatglm → deepseek → chatgpt) |
 | `chatglm` | Platform-level model: rotates accounts, never switches platform |
+| `deepseek` | Same, for DeepSeek web |
+| `chatgpt` | Same, for ChatGPT web — ⚠️ **requires network access to `chatgpt.com`** (proxy/VPN); the first request waits for page hydration (~30–90s); response is returned as a whole (no token streaming yet) |
 | `glm-4` / `glm-3` | Concrete ChatGLM model aliases |
 
 ## Multiple accounts (optional, recommended)

@@ -1,0 +1,36 @@
+event: delta_encoding
+data: "v1"
+
+data: {"type":"resume_conversation_token","kind":"topic","token":"eyJhbGciOiJFUzI1NiJ9.fake"}
+
+event: delta
+data: {"v":{"message":{"id":"sys-1","author":{"role":"system","name":null,"metadata":{}},"content":{"content_type":"text","parts":[""]},"status":"finished_successfully","end_turn":true,"weight":0.0}}}
+
+event: delta
+data: {"v":{"message":{"id":"user-1","author":{"role":"user","name":null,"metadata":{}},"content":{"content_type":"text","parts":["用一句话解释什么是递归。"]},"status":"finished_successfully","end_turn":true,"weight":1.0}}}
+
+data: {"type":"input_message","input_message":{"id":"user-1","author":{"role":"user"},"content":{"content_type":"text","parts":["用一句话解释什么是递归。"]}}}
+
+event: delta
+data: {"v":{"message":{"id":"asst-1","author":{"role":"assistant","name":null,"metadata":{}},"content":{"content_type":"text","parts":[""]},"status":"in_progress","end_turn":null,"weight":1.0,"recipient":"all"}}}
+
+event: delta
+data: {"p":"/message/content/parts/0","o":"append","v":"递归是"}
+
+event: delta
+data: {"p":"/message/content/parts/0","o":"append","v":"函数自己"}
+
+event: delta
+data: {"p":"/message/content/parts/0","o":"append","v":"调用自己。"}
+
+event: delta
+data: {"p":"/message/status","o":"replace","v":"finished_successfully"}
+
+event: delta
+data: {"p":"/message/end_turn","o":"replace","v":true}
+
+data: {"type":"message_marker","conversation_id":"6ad61833-9e3c-83e8-981f-05935a013a49"}
+
+data: {"type":"server_ste_metadata","metadata":{"server_ttfvt_ms":3276.6,"plan_type":"free"}}
+
+data: [DONE]
