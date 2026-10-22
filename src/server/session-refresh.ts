@@ -36,7 +36,16 @@ import { fetchAccountInfo } from '../browser/auth-capture.js';
 export const SESSION_REFRESH_INTERVAL_MS = 24 * 60 * 60_000;
 
 /** 服务启动后首次执行的延迟（等主流程稳定，别和启动任务抢浏览器）。 */
-export const SESSION_REFRESH_INITIAL_DELAY_MS = 60_000;
+/**
+ * 启动后首次执行保鲜的延迟。
+ *
+ * ⚠️ 2026-10-22 用户要求：**启动时就自动跑一次**（原来是等 60s，观感上像"没启动"）。
+ * 留 3 秒是让服务先把 HTTP server / provider 注册跑完，避免和首请求抢资源。
+ */
+export const SESSION_REFRESH_INITIAL_DELAY_MS = 3_000;
+
+/** 检查「哪些平台到点了」的间隔（不是执行间隔 —— 每个平台各自 24h）。 */
+export const SESSION_REFRESH_TICK_MS = 5 * 60_000;
 
 /** 打开页面后等多久再探测（页面要跑完启动逻辑才会恢复登录态）。 */
 const PROBE_WAIT_MS = 4000;
@@ -45,10 +54,69 @@ const PROBE_WAIT_MS = 4000;
 export interface SessionRefreshResult {
   /** 刷新成功（cookie/token 已写回）。 */
   refreshed: string[];
+  /** 因外部请求而中止保鲜的平台。 */
+  aborted: string[];
   /** 正在服务里使用中 → 跳过（避免顶掉会话）。 */
   skipped: string[];
   /** 打开/探测/写回失败。 */
   failed: string[];
+}
+
+/**
+ * 每个平台的保鲜状态。
+ *
+ * - `lastRefreshAt`：上次**结束**保鲜的时刻（也是一个 24h 周期的起点）。
+ * - `abortAt`：最近一次「外部有请求打到这个平台」的时刻 —— 用来**立即中止**正在进行的保鲜。
+ *
+ * ⚠️ 语义（2026-10-22 用户要求）：外部请求来了 → 该平台**立刻停止**保鲜，并**重置 24h 计时**
+ * （刚刚被真实使用过，会话是热的，没必要马上去刷）。照刷会和用户的请求**互相顶会话** ✗。
+ */
+interface PlatformRefreshState {
+  lastRefreshAt: number;
+  abortAt: number;
+}
+
+const platformStates = new Map<string, PlatformRefreshState>();
+
+function stateOf(platform: string): PlatformRefreshState {
+  let state = platformStates.get(platform);
+  if (!state) {
+    state = { lastRefreshAt: 0, abortAt: 0 };
+    platformStates.set(platform, state);
+  }
+  return state;
+}
+
+/**
+ * 外部请求使用了某个平台 —— 立即中止该平台正在进行的保鲜，并重置它的 24h 计时。
+ *
+ * 调用点：`failover.ts` 选定 provider 后（每个请求都会调）。
+ */
+export function notifyPlatformUsed(platform: string): void {
+  const state = stateOf(platform);
+  const now = Date.now();
+  state.lastRefreshAt = now; // 重置 24h 计时
+  state.abortAt = now; // 让正在跑的保鲜尽快退出
+}
+
+/** 这个平台是否**该**保鲜了（距上次 ≥ interval，且从未刷新过也算）。 */
+export function isPlatformRefreshDue(
+  platform: string,
+  intervalMs: number = SESSION_REFRESH_INTERVAL_MS,
+  now: number = Date.now(),
+): boolean {
+  const state = stateOf(platform);
+  return state.lastRefreshAt === 0 || now - state.lastRefreshAt >= intervalMs;
+}
+
+/** 指定时刻之后，这个平台是否收到过外部请求（= 应该中止本轮保鲜）。 */
+export function isPlatformAborted(platform: string, since: number): boolean {
+  return stateOf(platform).abortAt >= since;
+}
+
+/** 测试用：清空所有平台状态。 */
+export function resetRefreshState(): void {
+  platformStates.clear();
 }
 
 function sleep(ms: number): Promise<void> {
@@ -61,16 +129,22 @@ function sleep(ms: number): Promise<void> {
  * @param options.skip 正在服务里使用的账号（`platform/accountId`），一律跳过
  */
 export async function refreshIdleSessions(
-  options: { skip?: ReadonlySet<string> } = {},
+  options: {
+    skip?: ReadonlySet<string>;
+    /** 只刷这些平台（不给 = 全部到点的平台）。 */
+    platforms?: readonly string[];
+  } = {},
 ): Promise<SessionRefreshResult> {
   const skip = options.skip ?? new Set<string>();
-  const result: SessionRefreshResult = { refreshed: [], skipped: [], failed: [] };
+  const result: SessionRefreshResult = { refreshed: [], skipped: [], failed: [], aborted: [] };
 
+  const batchStartedAt = Date.now();
   let browser: Browser | null = null;
   try {
     browser = await firefox.launch({ headless: true });
 
-    for (const platform of PLATFORMS_WITH_PROVIDER) {
+    const targets = options.platforms ?? PLATFORMS_WITH_PROVIDER;
+    for (const platform of targets) {
       const loginUrl = PLATFORM_LOGIN_URLS[platform];
       if (!loginUrl) continue;
 
@@ -79,6 +153,14 @@ export async function refreshIdleSessions(
         if (skip.has(key)) {
           result.skipped.push(key);
           continue;
+        }
+
+        /* ⚠️ 外部请求刚打到这个平台 → **立即结束**该平台的保鲜（2026-10-22 用户要求）。
+         * 继续刷会和用户的请求互相顶会话（同一账号两处同时用）。 */
+        if (isPlatformAborted(platform, batchStartedAt)) {
+          result.aborted.push(platform);
+          logger.info(`[refresh] 外部请求已使用 ${platform} → 立即中止该平台的保鲜`);
+          break;
         }
 
         const auth = loadAuth(platform, { accountId });
@@ -152,6 +234,9 @@ export async function refreshIdleSessions(
           await context?.close().catch(() => undefined);
         }
       }
+
+      // 这个平台本轮走完（或被中止）→ 记录时间，下一个 24h 从此刻算起
+      if (!result.aborted.includes(platform)) stateOf(platform).lastRefreshAt = Date.now();
     }
   } catch (error) {
     logger.warn(`[refresh] 会话保鲜任务失败: ${String(error)}`);
@@ -175,19 +260,30 @@ export function startSessionRefreshLoop(options: {
   isInUse: () => ReadonlySet<string>;
   intervalMs?: number;
   initialDelayMs?: number;
+  /** 检查「哪些平台到点」的间隔（默认 5 分钟）。 */
+  tickMs?: number;
 }): void {
   if (initialTimer || intervalTimer) return;
 
   const intervalMs = options.intervalMs ?? SESSION_REFRESH_INTERVAL_MS;
   const delay = options.initialDelayMs ?? SESSION_REFRESH_INITIAL_DELAY_MS;
+  const tickMs = options.tickMs ?? SESSION_REFRESH_TICK_MS;
 
-  const runOnce = (): void => {
+  const tick = (reason: string): void => {
     if (running) return;
+
+    /* 只刷**到点**的平台（每个平台各自 24h；外部请求会推后它的计时）。 */
+    const due = PLATFORMS_WITH_PROVIDER.filter((platform) => isPlatformRefreshDue(platform, intervalMs));
+    if (due.length === 0) return;
+
     running = true;
-    void refreshIdleSessions({ skip: options.isInUse() })
+    logger.info(`[refresh] ${reason}：开始保鲜 ${due.join(', ')}`);
+    void refreshIdleSessions({ skip: options.isInUse(), platforms: due })
       .then((r) => {
         logger.info(
-          `[refresh] 本轮完成：刷新 ${r.refreshed.length} / 跳过 ${r.skipped.length} / 失败 ${r.failed.length}` +
+          `[refresh] 本轮完成：刷新 ${r.refreshed.length} / 跳过 ${r.skipped.length} / ` +
+            `失败 ${r.failed.length}` +
+            (r.aborted.length > 0 ? ` / 被外部请求中止 ${r.aborted.join(', ')}` : '') +
             (r.skipped.length > 0
               ? `（跳过：${r.skipped.join(', ')} —— 正在服务里使用，刷新会顶掉它们的会话）`
               : ''),
@@ -202,10 +298,11 @@ export function startSessionRefreshLoop(options: {
   initialTimer = setTimeout(() => {
     initialTimer = null;
     logger.info(
-      `[refresh] 会话保鲜已启用：每 ${Math.round(intervalMs / 3_600_000)} 小时刷新一次未在使用的账号`,
+      `[refresh] 会话保鲜已启用：启动时先跑一次，之后每 ${Math.round(intervalMs / 3_600_000)} 小时` +
+        `（每 ${Math.round(tickMs / 60_000)} 分钟检查一次；有外部请求的平台会被跳过并重新计时）`,
     );
-    runOnce();
-    intervalTimer = setInterval(runOnce, intervalMs);
+    tick('启动首轮');
+    intervalTimer = setInterval(() => tick('定时检查'), tickMs);
     // 不要因为定时器把进程拖住（服务本身有 HTTP server 保活；CLI 用完即走）
     intervalTimer.unref?.();
   }, delay);

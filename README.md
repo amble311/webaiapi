@@ -19,7 +19,7 @@ webaiapi start
 ```
 在agent中的调用配置如下：
 模型地址：http://0.0.0.0:8631/v1
-模型ID: mix, chatglm, deepseek #mix为自动选择可用平台，其余为指定使用该平台的模型。
+模型ID: mix, chatglm, deepseek，chatgpt。 #mix为自动选择可用平台，其余为指定使用该平台的模型。
 apikey: 随便填，不校验
 上下文输入：64K（65536）
 上下文输出：64K（65536）

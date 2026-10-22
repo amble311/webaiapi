@@ -42,6 +42,7 @@ import {
   logError as debugLogError,
 } from '../log/debug-logger.js';
 import { logger } from '../log/logger.js';
+import { logError } from '../log/error-log.js';
 import { getLastRawSse } from '../providers/chatglm-sse.js';
 import type { ChatRequest } from '../providers/base.js';
 import { formatMessagesAsText, formatToolsAsText } from '../tools/protocol.js';
@@ -1507,7 +1508,23 @@ export async function* streamChatCompletion(
   } catch (error) {
     const message = errorMessage(error);
     logger.error(`流式响应失败: ${message}`);
-    debugLogError(requestId, message, `平台=${currentPlatform}, 已收到=${fullResponse.length}字符`);
+    /* ⚠️ 结构化异常记录（2026-10-22 用户要求）：把「哪个请求/模型/平台、卡在哪个阶段、
+     * 已收到多少内容、耗时」写成一条 JSON 落盘 `logs/errors.log`，便于事后分析。
+     * 凭证类字段由 `logError` 统一脱敏。 */
+    const errorId = logError(
+      {
+        requestId,
+        model,
+        platform: currentPlatform ?? undefined,
+        phase: 'stream',
+        extra: {
+          receivedChars: fullResponse.length,
+          parsedToolCalls: parsedToolCalls.length,
+        },
+      },
+      error,
+    );
+    debugLogError(requestId, `[error:${errorId}] ${message}`, `平台=${currentPlatform}, 已收到=${fullResponse.length}字符`);
     logApiError(requestId, message, `平台=${currentPlatform}, 已收到=${fullResponse.length}字符`);
     yield contentChunk({ id: requestId, model, content: `[ERROR] ${message}`, finishReason: 'stop' });
     yield DONE;

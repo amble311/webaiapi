@@ -299,6 +299,22 @@ export async function startServer(): Promise<number> {
    * 定时器随服务停止而终止（`shutdown` 里 stop）。 */
   startSessionRefreshLoop({ isInUse: () => getModelRouter().getInUseAccounts() });
 
+  /* 预热需要「开页面等水合」的 provider（目前是 chatgpt：水合 30~90s）。
+   * 后台异步做，不阻塞启动 —— 这样用户第一次发消息时页面已经热了。 */
+  setTimeout(() => {
+    void (async () => {
+      const providers = getModelRouter().getAllProviders();
+      for (const [model, provider] of providers) {
+        if (model !== 'chatgpt') continue;
+        try {
+          await provider.warmup();
+        } catch (error) {
+          logger.warn(`[warmup] ${model} 预热失败: ${String(error).slice(0, 120)}`);
+        }
+      }
+    })();
+  }, 3000).unref?.();
+
   // ===== 优雅关闭 =====
   const shutdown = async (signal: string): Promise<void> => {
     logger.info(`收到 ${signal}，正在关闭...`);

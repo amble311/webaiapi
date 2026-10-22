@@ -61,6 +61,25 @@ export const RECENT_KEEP_MAX = 54000;
  */
 export const COMPRESS_MAX_ATTEMPTS = 3;
 
+/**
+ * **整次压缩的总预算**（毫秒）。
+ *
+ * ⚠️⚠️ 2026-10-21 实测事故：提示词 316,779 字符 → 6 块历史**串行**压缩，
+ * 每块 30~40s → 压缩一共吃掉 **198s**（整个 HTTP 请求只有 300s），
+ * 轮到主模型时只剩 73s → ChatGPT 的冷启动（浏览器 + 页面水合 30~90s）直接超时 ✗
+ * （用户看到 `平台 'chatgpt' 不可用: 请求超过截止时间（deadline）`）。
+ *
+ * 所以给压缩设**总预算**：超出的分块不再压缩，改用「原文截断」兜底（`allOk=false`，
+ * 不会写进摘要缓存）。宁可摘要糙一点，也不能把整个请求饿死。
+ */
+export const COMPRESS_TOTAL_BUDGET_MS = 90_000;
+
+/** 把「整个请求的截止时间」收敛成「压缩自己的截止时间」。 */
+export function compressionDeadline(deadlineTs?: number, now = Date.now()): number {
+  const own = now + COMPRESS_TOTAL_BUDGET_MS;
+  return deadlineTs ? Math.min(deadlineTs, own) : own;
+}
+
 /** 每次重试前至少要有的剩余预算（秒）。 */
 export const COMPRESS_RETRY_MIN_BUDGET = 45.0;
 
@@ -429,7 +448,7 @@ export async function shrinkPromptViaCompression(
           model,
           historyDb,
           requestId,
-          deadlineTs,
+          compressionDeadline(deadlineTs),
         );
         summary = r.summary;
         covered = r.allOk ? oldHistory.length : 0;
@@ -441,7 +460,7 @@ export async function shrinkPromptViaCompression(
         model,
         historyDb,
         requestId,
-        deadlineTs,
+        compressionDeadline(deadlineTs),
       );
       summary = r.summary;
       covered = r.allOk ? oldHistory.length : 0;

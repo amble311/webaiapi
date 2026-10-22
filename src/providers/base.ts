@@ -70,6 +70,17 @@ export abstract class BaseProvider {
   /** 删除会话。 */
   abstract deleteConversation(conversationId: string): Promise<void>;
 
+  /**
+   * 预热（**可选**）：服务启动后由后台调用一次，让**首个用户请求**不必付冷启动成本。
+   *
+   * ⚠️ 为什么需要（2026-10-21 实测）：ChatGPT 页面要水合 30~90s，
+   * 首个请求在 300s 预算里既要等压缩又要等水合 → 很容易超时。
+   * 默认什么都不做；需要预热的 provider 自己覆盖。
+   */
+  async warmup(): Promise<void> {
+    // 默认无操作
+  }
+
   /** 检查登录状态。 */
   abstract checkLoginStatus(): Promise<boolean>;
 

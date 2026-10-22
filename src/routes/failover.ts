@@ -16,6 +16,7 @@
  * 所以这里不需要 `aclosing` 的等价物，**但绝不能把 `for await` 换成手动
  * `while (true) { iterator.next() }`**，那样就丢掉了这层语言级保障。
  */
+import { notifyPlatformUsed } from '../server/session-refresh.js';
 import type { BaseProvider } from '../providers/base.js';
 import { getLastRawSse } from '../providers/chatglm-sse.js';
 import type { ChatRequest, ChatResponse } from '../providers/base.js';
@@ -276,6 +277,9 @@ export async function* streamWithFailover(
       }
 
       logger.info(`[_stream_with_failover] 使用 ${candidate.label}`);
+      /* ⚠️ 用户要求（2026-10-22）：外部请求打到某平台 → 立即中止该平台正在进行的保鲜，
+       * 并重置它的 24h 计时（刚刚用过，会话是热的，马上再刷会互相顶会话）。 */
+      notifyPlatformUsed(activePlatform);
       logAiPlatformRequest({
         requestId,
         platform: extractPlatformName(active.platform),
