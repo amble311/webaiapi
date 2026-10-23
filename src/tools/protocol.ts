@@ -75,6 +75,41 @@ export function formatToolsAsText(
   const editName = detected['edit'] ?? 'SearchReplace';
 
   const lines: string[] = [
+    /* ⚠️⚠️ 2026-10-23 真机实测（ChatGPT）：模型**把自己当成"没有文件系统的聊天助手"**，
+     * 遇到"列出当前目录"这种任务时直接用推理拒绝 ——
+     * 原文：`当前运行环境中不存在目录 /home/amble/object/webaiapi，因此暂时无法列出该工作目录下的文件。`
+     * （0 个工具调用 ✗）。加下面这段「你不是在回答问题 / 路径存不存在不归你判断 / 禁止说无法访问」
+     * 之后，同一请求立刻正确输出 `<tool_call>{...}</tool_call>` ✓。
+     * 这条对 deepseek/chatglm 同样必要（它们也踩过"只用文字描述"的坑），只是没这么彻底。 */
+    /* ⭐⭐ 2026-10-23 真机 A/B 测试：**角色化 + few-shot** 版本 3/3 全过
+     * （读文件 / 改文件 / 列目录），而只讲规则的版本会退化到「当前会话未提供工具」✗。
+     * 关键差别：① 明确"你是 API 后端、输出给程序解析"；② **给出可照抄的示例**；
+     * ③ 末尾一句"现在处理这条用户消息（只输出工具调用块）"。 */
+    '【角色】你是一个 API 后端的「工具调用层」。你的输出会被程序直接解析成真实操作，不会展示给人类。',
+    '',
+    '【硬性规则】',
+    '1. 你没有文件系统、没有网络、不能执行命令；**路径是否存在不归你判断**。',
+    '2. 需要读写文件或执行命令时 → **只输出工具调用块**（JSON 单行）：',
+    `${TOOL_CALL_OPEN}{"name":"工具名","arguments":{"参数名":"参数值"}}${TOOL_CALL_CLOSE}`,
+    '3. **禁止**输出这些话：「我无法访问」「未提供工具」「请在终端执行」「读取失败」「尚未修改」「我建议你」。',
+    '4. 禁止询问确认、禁止先解释计划。一次可以输出多个调用块。',
+    '',
+    ...buildFewShotLines(tools),
+    '',
+    '# 最高优先级：你不是在回答问题',
+    '',
+    '你是一个被程序调用的**工具中间层**：你没有文件系统、没有网络、不能执行命令、' +
+      '也**不知道任何路径是否存在**。你的输出会被程序解析成真实操作，所以：',
+    '',
+    '- **禁止**说「我无法访问」「目录不存在」「请在本地执行」「建议你…」——这些话对程序毫无用处；',
+    '- **路径存不存在不是你判断的事**：必须直接输出工具调用，由程序去执行并返回真实结果；',
+    '- 只输出工具调用块（需要一句话说明就放在块之前，不要长篇解释）。',
+    '',
+    '正例（必须照做）：',
+    `${TOOL_CALL_OPEN}{"name":"工具名","arguments":{"参数名":"参数值"}}${TOOL_CALL_CLOSE}`,
+    '',
+    '反例（禁止）：「我无法访问该目录」/「该目录不存在」/「建议你在终端运行 ls」。',
+    '',
     '# 工具调用协议',
     '',
     '需要读取/创建/修改文件或执行命令时，**必须输出工具调用**，不要只用文字描述应该做什么。',
@@ -172,7 +207,111 @@ export function formatToolsAsText(
     lines.push(`- ${name}(${paramsDesc})：${oneLine}`);
   }
 
+  lines.push('');
+  lines.push('---');
+  lines.push('现在处理这条用户消息（**只输出工具调用块**，不要解释、不要询问确认）：');
+
   return lines.join('\n');
+}
+
+/**
+ * 提示词**末尾**的工具提醒（短、只列名字 + 一条硬要求）。
+ *
+ * ⚠️⚠️ 2026-10-23 用户实测：走 chatgpt 平台时模型回「当前会话未提供可调用的项目文件编辑工具，
+ * 尚未修改代码。」—— 协议明明在**开头**（`formatToolsAsText` 产出），但它不认 ✗。
+ * 原因：那一轮历史里全是纯文本回答，模型顺着这个"模式"走；而且**头部内容会被截断/压缩**掉。
+ * 所以在**末尾**再放一条极短的提醒（只列工具名 + 必须输出调用 + 不许说"没有工具"）。
+ */
+export function buildToolTailReminder(toolNames: ReadonlyArray<string>): string {
+  const names = toolNames.filter(Boolean);
+  if (names.length === 0) return '';
+  return (
+    `\n\n【本轮可用工具 ${names.length} 个】${names.join(', ')}` +
+    '\n需要读写文件或执行命令时，**必须在本条回复里输出工具调用块**：' +
+    `${TOOL_CALL_OPEN}{"name":"工具名","arguments":{…}}${TOOL_CALL_CLOSE}` +
+    '\n不要说「当前会话未提供工具」「我无法访问文件」—— 工具是真实可用的，直接调用即可。'
+  );
+}
+
+/**
+ * 判断「模型声称没有工具 / 无法访问文件」这类**软拒绝**。
+ *
+ * ⚠️ 2026-10-23 用户实测：走 chatgpt 时它回
+ * 「当前会话未提供可调用的项目文件编辑工具，尚未修改代码。」—— 这不是错误，是**拒答** ✗。
+ * failover 只在**抛错**时切换平台，所以这种"假成功"会把废话直接回给用户。
+ *
+ * 判据（宁可漏判也不要误伤）：**没有解析出任何工具调用** + 命中强特征 + 文本很短。
+ */
+const TOOL_REFUSAL_PATTERNS: ReadonlyArray<RegExp> = [
+  /未提供.{0,10}工具/u,
+  /没有.{0,6}(可用的|提供).{0,6}工具/u,
+  /我无法访问.{0,10}(文件|目录|本地)/u,
+  /看不到.{0,6}(文件|目录)/u,
+  /无法读取.{0,6}(文件|目录)/u,
+  /请在.{0,6}(本地|终端|你自己).{0,6}(执行|运行|修改)/u,
+];
+
+export function looksLikeToolRefusal(text: string): boolean {
+  const t = String(text || '').trim();
+  if (!t || t.length > 400) return false; // 长回答里有这些词多半是真在讨论
+  return TOOL_REFUSAL_PATTERNS.some((re) => re.test(t));
+}
+
+/**
+ * 用**真实工具名 / 真实参数名**生成 few-shot 示例。
+ *
+ * ⚠️ 2026-10-23 A/B 实测：ChatGPT 对「示例」的服从度远高于「规则」——
+ * 加上 2~3 条可照抄的示例后，读/改/列目录 3/3 全部正确输出工具调用 ✓。
+ * 示例必须用**本次真实存在的工具名**（否则模型会照着编一个不存在的工具 ✗）。
+ */
+function buildFewShotLines(tools: ReadonlyArray<ToolDefinition>): string[] {
+  const pick = (candidates: ReadonlyArray<string>): ToolDefinition | null => {
+    for (const name of candidates) {
+      const found = tools.find((tool) => toolNameOf(tool) === name);
+      if (found) return found;
+    }
+    return null;
+  };
+
+  const firstParam = (tool: ToolDefinition): string => {
+    const props = tool?.function?.parameters?.properties ?? {};
+    const required = toolRequiredParams(tool);
+    const names = Object.keys(props);
+    return names.find((n) => required.includes(n)) ?? names[0] ?? 'path';
+  };
+
+  const sampleValue = (param: string): string => {
+    if (/command|cmd|script/i.test(param)) return 'ls';
+    if (/dir|folder/i.test(param)) return '/home/user/project';
+    if (/pattern|query|keyword/i.test(param)) return 'TODO';
+    if (/content|text|body/i.test(param)) return '新内容';
+    if (/search|old/i.test(param)) return '旧内容';
+    if (/replace|new/i.test(param)) return '新内容';
+    return '/home/user/project/a.py';
+  };
+
+  const scenarios: Array<{ users: string; tools: ReadonlyArray<string> }> = [
+    { users: '读取 /home/user/project/a.py', tools: ['read_file', 'Read', 'read'] },
+    { users: '列出 /home/user/project 下有哪些文件', tools: ['list_dir', 'LS', 'list'] },
+    { users: '把 a.py 里的 10 改成 20', tools: ['edit_file', 'Edit', 'SearchReplace'] },
+    { users: '跑一下测试', tools: ['bash', 'Bash', 'shell'] },
+  ];
+
+  const lines: string[] = ['【示例】'];
+  let added = 0;
+  for (const scenario of scenarios) {
+    if (added >= 3) break;
+    const tool = pick(scenario.tools);
+    if (!tool) continue;
+    const name = toolNameOf(tool);
+    const param = firstParam(tool);
+    const args = JSON.stringify({ [param]: sampleValue(param) });
+    lines.push(`用户：${scenario.users}`);
+    lines.push(`助手：${TOOL_CALL_OPEN}{"name":"${name}","arguments":${args}}${TOOL_CALL_CLOSE}`);
+    added += 1;
+  }
+  if (added === 0) return []; // 认不出任何常见工具 → 不硬编示例
+  return lines;
 }
 
 /** `formatToolsAsText` + 映射表的组合结果。 */

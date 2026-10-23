@@ -45,7 +45,12 @@ import { logger } from '../log/logger.js';
 import { logError } from '../log/error-log.js';
 import { getLastRawSse } from '../providers/chatglm-sse.js';
 import type { ChatRequest } from '../providers/base.js';
-import { formatMessagesAsText, formatToolsAsText } from '../tools/protocol.js';
+import {
+  buildToolTailReminder,
+  formatMessagesAsText,
+  formatToolsAsText,
+  looksLikeToolRefusal,
+} from '../tools/protocol.js';
 import { parseToolCallsFromText } from '../tools/parse.js';
 import { buildActionRecoveryPrompt } from '../tools/prompts.js';
 import { directConvertToToolCalls, convertTextToToolCalls } from '../tools/convert.js';
@@ -75,7 +80,7 @@ import {
   type ToolDefinition,
 } from '../types/message.js';
 import type { ChatCompletionRequest } from '../types/openai.js';
-import { errorMessage } from '../utils/errors.js';
+import { errorMessage, PlatformUnavailableError } from '../utils/errors.js';
 import { buildReparseInput, streamWithFailover } from './failover.js';
 import {
   BROWSER_PROMPT_MAX_LEN,
@@ -443,6 +448,18 @@ export async function preparePrompt(
     messageText = `${toolsText}\n\n${messageText}`;
   }
 
+  /* ⚠️ 末尾再提醒一次工具（2026-10-23 实测：chatgpt 会回「当前会话未提供工具」✗）——
+   * 尾部不受头部截断/压缩影响，且模型对最新的内容最敏感。 */
+  const toolReminder = buildToolTailReminder(
+    (rawRequest.tools ?? [])
+      .map((tool) => {
+        const fn = (tool as { function?: { name?: unknown } }).function;
+        return typeof fn?.name === 'string' ? fn.name : '';
+      })
+      .filter((name) => name.length > 0),
+  );
+  if (toolReminder) messageText += toolReminder;
+
   /* ===== 同一会话只补发增量 =====
    * 网页会话里已经有上一次发进去的完整提示词与模型自己的回复，
    * 因此这次只需要发「新增消息 + 工具协议」。
@@ -454,6 +471,7 @@ export async function preparePrompt(
     const deltaContext = formatMessagesAsText(deltaMessages as unknown as ChatMessage[]);
     deltaText = toolsText ? `${toolsText}\n\n${deltaContext}` : deltaContext;
     deltaText += roundInstruction;
+    if (toolReminder) deltaText += toolReminder;
     if (deltaText.length > BROWSER_PROMPT_MAX_LEN) {
       deltaText = truncatePromptForBrowser(deltaText);
     }
@@ -799,6 +817,19 @@ export async function parseAndRecoverToolCalls(params: {
    *    改写成「正在执行 N 个操作：…」摘要，那种摘要**不能**当回退正文下发
    *    （客户端会把它当最终回答显示后停住）。 */
   const fallbackBodyText = parsedText.trim();
+
+  /* ⚠️⚠️ 「声称没有工具」的**软拒绝** → 抛错让 failover 换平台（2026-10-23 用户实测）：
+   * chatgpt 会回「当前会话未提供可调用的项目文件编辑工具，尚未修改代码。」——
+   * 这不是错误、是拒答，不拦的话会把废话当最终回答回给客户端 ✗。 */
+  if (tools.length > 0 && parsedToolCalls.length === 0 && looksLikeToolRefusal(fallbackBodyText)) {
+    logger.warn(
+      `[tool_calls] 模型声称没有可用工具（${JSON.stringify(fallbackBodyText.slice(0, 80))}）→ 抛错换平台`,
+    );
+    throw new PlatformUnavailableError(
+      currentPlatform ?? rawRequest.model,
+      '模型声称当前会话没有可用工具（拒答）→ 已切换平台重试',
+    );
+  }
 
   /** 去掉工具调用块后的纯文本（回退用 —— `parsed.text` 已剔除命中区间）。 */
   const stripToolCallBlocks = (text: string): string =>

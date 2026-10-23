@@ -35,7 +35,7 @@ import {
 const logger = baseLogger;
 
 /** 支持网页会话复用（增量发送）的平台。 */
-const SESSION_REUSE_PLATFORMS: ReadonlySet<string> = new Set(['chatglm']);
+const SESSION_REUSE_PLATFORMS: ReadonlySet<string> = new Set(['chatglm', 'chatgpt']);
 
 /**
  * 构造「两轮对话」策略的输入文本。

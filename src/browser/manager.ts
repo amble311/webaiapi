@@ -184,7 +184,7 @@ async function injectPageScripts(target: Page): Promise<void> {
 }
 
 /** 关闭并清掉某个通道的 context / page。 */
-async function disposeChannel(channelKey: string): Promise<void> {
+export async function disposeChannel(channelKey: string): Promise<void> {
   const ctx = channelContexts.get(channelKey);
   channelContexts.delete(channelKey);
   channelPages.delete(channelKey);

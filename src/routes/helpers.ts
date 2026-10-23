@@ -529,7 +529,7 @@ const SESSION_STATE_TTL = 1800.0;
  * 其他平台即使共用同一个浏览器页面也不能套用增量协议
  * （它们各自会导航到自己的站点，会话互不相通）。
  */
-const SESSION_REUSE_PLATFORMS: ReadonlySet<string> = new Set(['chatglm']);
+const SESSION_REUSE_PLATFORMS: ReadonlySet<string> = new Set(['chatglm', 'chatgpt']);
 
 /** 把 `provider.platform` 归一成站点名（`chatglm-browser` → `chatglm`）。 */
 export function platformOf(platformName: string): string {

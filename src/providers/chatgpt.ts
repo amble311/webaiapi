@@ -22,7 +22,7 @@ import { logger } from '../log/logger.js';
 import { logError } from '../log/error-log.js';
 import { evaluateFn, iife } from '../browser/js-eval.js';
 import { STEALTH_JS } from '../browser/stealth.js';
-import { getChannelPage, loadCookies, peekPage } from '../browser/manager.js';
+import { disposeChannel, getChannelPage, loadCookies, peekPage } from '../browser/manager.js';
 import { PlatformUnavailableError } from '../utils/errors.js';
 import { BaseProvider, type ChatRequest, type ChatResponse } from './base.js';
 
@@ -41,7 +41,7 @@ const SEND_SELECTOR = 'button[aria-label="Send"], button[aria-label="发送"]';
  * `interactive`，但编辑器要到 **46s** 才出现；`goto` 遇到网络抖动（`NS_ERROR_NET_PARTIAL_TRANSFER`）
  * 时还要再重试 —— 原来 60s 的预算刚好卡死在边界上 ✗（日志「输入框在 60s 内没渲染出来」）。
  * 整个 HTTP 请求有 300s，这里给到 180s。 */
-const EDITOR_WAIT_MS = 180_000;
+const EDITOR_WAIT_MS = 100_000;
 
 /** 编辑器等待期间的进度日志间隔。 */
 const EDITOR_PROGRESS_MS = 15_000;
@@ -100,6 +100,44 @@ function sessionProbeJs(): string {
  * - 真正可靠的信号是页面上有没有 **停止生成（Stop）按钮** —— 生成中它一直在，
  *   生成结束才变回 Send ✓。
  */
+/**
+ * 统计账号的「记忆（Memory）」条数。
+ *
+ * ⚠️⚠️ 2026-10-23 真机定位：ChatGPT 的 **Memory 是跨对话持久化**的 ——
+ * 实测它把「用户指定的暗号是紫水晶」「玄猪/Auto.js 的工作规范…」都存进了记忆，
+ * 于是**即使开新对话**，模型仍然带着别的项目的信息回答 ✗
+ * （用户在 btc 项目里却收到 xzh 项目的内容，就是这个原因）。
+ * 记忆开关是**账号级设置**，我们不改它（那是用户的个人数据），但会告警提示。
+ */
+async function countMemories(page: Page): Promise<number> {
+  try {
+    const count = await evaluateFn<number>(
+      page,
+      `async () => {
+  try {
+    const s = await fetch('https://chatgpt.com/api/auth/session', { credentials: 'include' });
+    const d = await s.json();
+    const token = String((d && d.accessToken) || '');
+    if (!token) return 0;
+    const r = await fetch('https://chatgpt.com/backend-api/memories?include_memory_entries=true', {
+      headers: { authorization: 'Bearer ' + token, accept: 'application/json' },
+      credentials: 'include',
+    });
+    if (!r.ok) return 0;
+    const body = await r.json();
+    const list = body && (body.memories || body.entries);
+    return Array.isArray(list) ? list.length : 0;
+  } catch (e) {
+    return 0;
+  }
+}`,
+    );
+    return Number(count) || 0;
+  } catch {
+    return 0;
+  }
+}
+
 /** 读一段页面文本的脚本（函数表达式，交给 iife 包装）。 */
 const READ_DOM_TEXT_JS = `() => {
   /* ⚠️⚠️ 2026-10-22 真机实测（两轮）：用"整个 body 的文本"提取会被**页面噪音**污染 ✗ ——
@@ -332,7 +370,14 @@ const ok = await evaluateFn<boolean>(
     page,
     `() => {
 try {
-    const el = document.querySelector('#prompt-textarea, [contenteditable="true"]');
+    /* ⚠️ 2026-10-23 实测：切到新对话后，DOM 里**旧会话的编辑器还残留着（隐藏）** ——
+     * 往隐藏元素 type 永远是 0 字符 ✗。必须挑**可见**的那个（有尺寸、在视口内）。 */
+    const all = Array.from(document.querySelectorAll('#prompt-textarea, [contenteditable="true"]'));
+    const visible = all.filter((e) => {
+      const r = e.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    });
+    const el = visible[visible.length - 1] || null;
     if (!el) return false;
     el.focus();
     const sel = window.getSelection();
@@ -348,7 +393,19 @@ try {
 }
 }`,
 ).catch(() => false);
-return Boolean(ok);
+if (ok) return true;
+
+/* ⚠️ 2026-10-23 实测：**切到新对话后**编辑器是重新挂载的，execCommand 会落空
+ * （日志「编辑器文本 0 字符（期望 23）」✗）→ 退回**真实按键**（React 只认这个）。 */
+try {
+  if ((await editorText(page)).trim().length === 0) {
+    await page.keyboard.type(text, { delay: 1 });
+    return true;
+  }
+} catch {
+  // 忽略
+}
+return false;
 }
 
 /** 读编辑器当前文本。 */
@@ -356,7 +413,12 @@ async function editorText(page: Page): Promise<string> {
 return (
     (await evaluateFn<string>(
       page,
-      `() => { const el = document.querySelector(${JSON.stringify(EDITOR_SELECTOR)}); return String((el && (el.innerText || el.value)) || ''); }`,
+      `() => {
+        const all = Array.from(document.querySelectorAll(${JSON.stringify(EDITOR_SELECTOR)}));
+        const visible = all.filter((e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+        const el = visible[visible.length - 1] || all[all.length - 1] || null;
+        return String((el && (el.innerText || el.value)) || '');
+      }`,
     ).catch(() => '')) || ''
 );
 }
@@ -369,6 +431,11 @@ export class ChatGptBrowserProvider extends BaseProvider {
   private preparedFor: string | null = null;
   private lastLoginCheck = 0;
   private loggedIn = false;
+
+  /** 上一次成功发送时所属的**逻辑会话**（`session_key`）与它的网页会话 URL。
+   * 两者都匹配时才复用（只发增量）；否则开新对话 + 发完整提示词。 */
+  private reuseSessionKey = '';
+  private reuseConversationUrl = '';
 
   constructor(options: { accountId: string; channelKey?: string }) {
     super('chatgpt-browser');
@@ -429,8 +496,23 @@ export class ChatGptBrowserProvider extends BaseProvider {
   /** 拿到一个已就绪（已登录 + 编辑器可用）的页面。 */
   private async ensurePage(): Promise<Page> {
     const page = await this.ensureSurface();
-    await this.waitForEditor(page);
-    return page;
+    try {
+      await this.waitForEditor(page);
+      return page;
+    } catch (error) {
+      /* ⚠️ 2026-10-23 实测：页面有时**彻底卡死**（占位框 60s 甚至 180s 都不挂载输入框，
+       * reload 也救不回来）—— 大概率是前端 chunk 加载失败留下的坏状态。
+       * 对策：**丢弃这个 context，重建通道页**再等一次（比 reload 彻底）。 */
+      logger.warn(
+        `[chatgpt] 输入框长时间未就绪（${String(error).slice(0, 100)}）→ 重建通道页重试`,
+      );
+      this.page = null;
+      this.preparedFor = null;
+      await disposeChannel(this.channelKey).catch(() => undefined);
+      const fresh = await this.ensureSurface();
+      await this.waitForEditor(fresh);
+      return fresh;
+    }
   }
 
   /** 页面 + cookie + 注入脚本 + 导航到首页（**不等编辑器**）。 */
@@ -503,10 +585,17 @@ export class ChatGptBrowserProvider extends BaseProvider {
     const deadline = startedAt + EDITOR_WAIT_MS;
     let clicks = 0;
     let lastProgress = 0;
+    /* ⚠️ 2026-10-23 实测：页面有时**卡在"只有占位框"**（`readyState=interactive` 但编辑器
+     * 152s 都不挂载，前端的 JS 没跑完/某个请求挂住 ✗）。死等没用 → 卡满 60s 就**重载一次**。 */
+    let reloaded = false;
     while (Date.now() < deadline) {
-      const has = await evaluateFn<boolean>(page, `() => Boolean(document.querySelector(${JSON.stringify(EDITOR_SELECTOR)}))`).catch(
-        () => false,
-      );
+      const has = await evaluateFn<boolean>(
+        page,
+        `() => Array.from(document.querySelectorAll(${JSON.stringify(EDITOR_SELECTOR)})).some((e) => {
+          const r = e.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        })`,
+      ).catch(() => false);
       if (has) {
         /* ⚠️ 编辑器出现 ≠ 页面可用（2026-10-22 用户实测：控件有了但要挺久才真正就绪 ✗）。
          * 用「网络静默」作为水合完成的代理信号，再补 1.5s 余量。 */
@@ -514,6 +603,15 @@ export class ChatGptBrowserProvider extends BaseProvider {
         await sleep(1500);
         return;
       }
+      /* 卡满 60s 还没编辑器 → 重载一次（一次性，避免无限刷） */
+      if (!reloaded && Date.now() - startedAt > 60_000) {
+        reloaded = true;
+        logger.warn('[chatgpt] 60s 仍只有占位框 → 重载页面再等（水合卡住）');
+        await page.reload({ waitUntil: 'commit', timeout: 30_000 }).catch(() => undefined);
+        await sleep(2000);
+        continue;
+      }
+
       /* 进度日志：水合要几十秒，没有日志的话用户会以为卡死（2026-10-22 实测 46s）。 */
       const waited = Date.now() - startedAt;
       if (waited - lastProgress >= EDITOR_PROGRESS_MS) {
@@ -532,19 +630,37 @@ export class ChatGptBrowserProvider extends BaseProvider {
         );
       }
 
-      /* 每 5 秒用**原始鼠标**点一下占位框（它被覆盖时 Playwright 的 click 会超时，
-       * 但点击本身能触发内容编辑器挂载）。 */
-      if (clicks < 10) {
-        const box = await page
-          .locator(PLACEHOLDER_SELECTOR)
-          .first()
-          .boundingBox()
-          .catch(() => null);
-        if (box) {
-          await page
-            .mouse.click(box.x + box.width / 2, box.y + box.height / 2)
-            .catch(() => undefined);
+      /* 每轮都试着**点一下输入框**把它"激活"。
+       * ⚠️⚠️ 2026-10-23 截图实证：新对话的输入框是**占位 textarea**（"Ask ChatGPT"），
+       * **必须点一下**才会换成正可编辑的 contenteditable；只等不点 = 永远等不到 ✗。
+       * 三种点法都试（占位框选择器 / 无障碍角色 / 坐标兜底），因为前端结构常变。 */
+      if (clicks < 40) {
+        let clicked = false;
+
+        // ① 无障碍角色：textarea 与 contenteditable 都会暴露成 textbox
+        try {
+          const textbox = page.getByRole('textbox').last();
+          if ((await textbox.count()) > 0) {
+            await textbox.click({ timeout: 2000, force: true });
+            clicked = true;
+          }
+        } catch {
+          // 换下一种
+        }
+
+        // ② 占位框选择器（原始鼠标点击，绕开遮挡检查）
+        if (!clicked) {
+          const box = await page.locator(PLACEHOLDER_SELECTOR).first().boundingBox().catch(() => null);
+          if (box) {
+            await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2).catch(() => undefined);
+            clicked = true;
+          }
+        }
+
+        if (clicked) {
           clicks += 1;
+          await sleep(600);
+          continue; // 点完立刻复查编辑器是否挂载出来
         }
       }
       await sleep(2500);
@@ -559,9 +675,89 @@ export class ChatGptBrowserProvider extends BaseProvider {
     );
   }
 
-  /** 在页面里输入并发送。 */
+  /**
+   * 开一个**新对话**（每个请求都开）。
+   *
+   * ⚠️⚠️ 2026-10-23 用户实测（上下文串项目）：在 `btc` 项目里跑 agent，ChatGPT 回复的却是
+   * `xzh` 项目的内容（`/home/amble/object/xzh`、`xuanzhu@0.4.5` 的发布记录…）——
+   * 因为我们一直往**同一个网页会话**里追加消息，上一轮（xzh）的上下文留在那个 thread 里，
+   * 模型自然带着它回答 ✗。
+   *
+   * 客户端**每轮都会发完整历史**，所以开新对话**不会丢上下文** ✓，只会丢掉「别的项目」的残留 ✓。
+   *
+   * ⚠️ 优先点「New chat」按钮（**客户端路由**，不重新加载页面）——
+   * 直接 `goto` 首页会再走一次 46s 的页面水合 ✗。
+   */
+  /**
+   * 保证当前页面处于**一个干净的新对话**（没有任何历史回答）。
+   *
+   * ⚠️⚠️ 2026-10-23 用户实测（上下文串项目）：在 `btc` 项目里跑 agent，ChatGPT 回复的却是
+   * `xzh` 项目的内容 —— 因为我们一直往**同一个网页会话**追加消息，上一轮（xzh）的上下文
+   * 留在 thread 里，模型自然带着它回答 ✗。客户端每轮都发完整历史，所以新对话不丢上下文 ✓。
+   *
+   * ⚠️ 实测的两条坑：
+   * ① 对话页的侧栏是**折叠**的 → `button[aria-label="New chat"]` 存在但不可点击 ✗ → 要 `force`；
+   * ② **回首页不一定干净**：ChatGPT 会自动恢复上一个会话（URL 又变成 `/c/…`）✗ ——
+   *    所以必须**验证**（新对话里不该出现任何「ChatGPT said:」）。
+   */
+  private async startNewChat(page: Page): Promise<boolean> {
+    const hasAnyAnswer = async (): Promise<boolean> => {
+      const state = await readDomAnswerState(page).catch(() => ({ hasMarker: false }));
+      return Boolean((state as { hasMarker?: boolean }).hasMarker);
+    };
+
+    const clickNewChat = async (): Promise<boolean> => {
+      try {
+        const button = page.getByRole('button', { name: 'New chat' }).first();
+        if ((await button.count()) === 0) return false;
+        await button.click({ timeout: 5000, force: true });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const inConversation = /\/c\//.test(page.url());
+      logger.info(
+        `[chatgpt:newchat] 第 ${attempt} 次：url=${page.url().slice(0, 60)} 在会话中=${inConversation} 有回答=${await hasAnyAnswer()}`,
+      );
+      if (!inConversation && !(await hasAnyAnswer())) return true; // 已经干净
+
+      const clicked = await clickNewChat();
+      if (clicked) {
+        for (let i = 0; i < 20; i += 1) {
+          await sleep(250);
+          if (!/\/c\//.test(page.url())) break;
+        }
+        const clean = !/\/c\//.test(page.url()) && !(await hasAnyAnswer());
+        logger.info(
+          `[chatgpt:newchat] 点 New chat 后：url=${page.url().slice(0, 60)} 干净=${clean}`,
+        );
+        if (clean) {
+          logger.info('[chatgpt] 已切换到新对话（点 New chat）');
+          return true;
+        }
+      }
+
+      /* 兜底：回首页。⚠️ 可能被自动恢复到上个会话 → 下一轮循环会再点一次 New chat。 */
+      logger.warn(`[chatgpt] 第 ${attempt} 次尝试新对话未成功 → 回首页重试`);
+      await page.goto(HOME_URL, { waitUntil: 'commit', timeout: 30_000 }).catch(() => undefined);
+      await sleep(2000);
+    }
+
+    const ok = !/\/c\//.test(page.url()) && !(await hasAnyAnswer());
+    if (!ok) {
+      logger.warn('[chatgpt] ⚠️ 没能确认已切到新对话 —— 可能会带上上一轮上下文');
+    }
+    return ok;
+  }
+
+  /** 在页面里输入并发送。 */  /** 在页面里输入并发送。 */
   private async sendMessage(page: Page, text: string): Promise<void> {
-    const editor = page.locator(EDITOR_SELECTOR).first();
+    /* ⚠️ 必须取**可见**的那个（2026-10-23 实测）：切新对话后 DOM 里还留着旧会话的隐藏编辑器，
+     * `.first()` 会点到隐藏元素 → 键入全丢（日志「编辑器文本 0 字符」✗）。 */
+    const editor = page.locator(`${EDITOR_SELECTOR} >> visible=true`).first();
 
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       /* 点一下编辑器确保焦点（原始鼠标：Playwright 的 click 会因遮挡超时）。 */
@@ -569,10 +765,39 @@ export class ChatGptBrowserProvider extends BaseProvider {
       if (box) await page.mouse.click(box.x + 24, box.y + Math.min(box.height / 2, 20));
       await sleep(300);
 
+      /* 焦点不在编辑器里 → 强制聚焦（点击可能落在遮罩上）。 */
+      const focused = await evaluateFn<boolean>(
+        page,
+        `() => {
+          const act = document.activeElement;
+          return Boolean(act && act.getAttribute && act.getAttribute('contenteditable') === 'true');
+        }`,
+      ).catch(() => false);
+      if (!focused) {
+        await evaluateFn<boolean>(
+          page,
+          `() => {
+            const all = Array.from(document.querySelectorAll('#prompt-textarea, [contenteditable="true"]'));
+            const vis = all.filter((e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+            const el = vis[vis.length - 1] || null;
+            if (!el) return false;
+            el.focus();
+            return true;
+          }`,
+        ).catch(() => false);
+        await sleep(200);
+      }
+
       await fillEditor(page, text);
       await sleep(600);
 
-      const typed = await editorText(page);
+      let typed = await editorText(page);
+      /* ⚠️ 兜底：编辑器仍是空的（切新对话后 execCommand 会落空）→ 真实按键。 */
+      if (typed.trim().length === 0) {
+        await page.keyboard.type(text, { delay: 1 }).catch(() => undefined);
+        await sleep(600);
+        typed = await editorText(page);
+      }
       const sendReady = await page
         .locator(SEND_SELECTOR)
         .first()
@@ -621,7 +846,15 @@ export class ChatGptBrowserProvider extends BaseProvider {
    */
   override async warmup(): Promise<void> {
     try {
-      await this.ensurePage();
+      const page = await this.ensurePage();
+      const memories = await countMemories(page);
+      if (memories > 0) {
+        logger.warn(
+          `[chatgpt] ⚠️ 该账号开启了「记忆」（${memories} 条）—— 记忆是**跨对话**生效的，` +
+            '会把你其它项目的信息带进当前任务的回答（实测：在 btc 项目里答出 xzh 的内容）。' +
+            '建议在 ChatGPT → 设置 → 个性化 → 记忆 里关闭它。',
+        );
+      }
       logger.info('[chatgpt] 预热完成：页面已就绪（首个请求不必再等水合）');
     } catch (error) {
       logger.warn(`[chatgpt] 预热失败（不影响后续请求，届时会重试）: ${String(error).slice(0, 160)}`);
@@ -641,7 +874,39 @@ export class ChatGptBrowserProvider extends BaseProvider {
    */
   async *chatStream(request: ChatRequest): AsyncGenerator<ChatResponse> {
     const page = await this.ensurePage();
-    const text = guardChatgptPrompt(request.message);
+
+    /* ⭐ **按会话复用**（2026-10-23 用户要求：每次新对话会逼 agent 重发完整历史，太浪费上下文）：
+     * 同一个 `session_key` 且页面仍停在那条网页会话上 → **只发增量**（网页自己记得上文）；
+     * 换会话 / 页面已经漂走 → 开新对话并改发**完整提示词**（保证不丢上下文）。
+     * 这也顺带解决了「在 btc 项目里却带着 xzh 上下文」：不同会话一定是不同网页对话。 */
+    const ctx = request.context ?? {};
+    const deltaText = typeof ctx['delta_message'] === 'string' ? ctx['delta_message'] : '';
+    const fullText = typeof ctx['full_message'] === 'string' ? ctx['full_message'] : request.message;
+    const sessionKey = typeof ctx['session_key'] === 'string' ? ctx['session_key'] : '';
+    const isDelta = deltaText.length > 0 && request.message === deltaText;
+    const canReuse =
+      isDelta &&
+      sessionKey !== '' &&
+      sessionKey === this.reuseSessionKey &&
+      this.reuseConversationUrl !== '' &&
+      page.url() === this.reuseConversationUrl;
+
+    let text = guardChatgptPrompt(request.message);
+
+    if (canReuse) {
+      logger.info(`[chatgpt] 复用同一网页会话，只发增量 ${text.length} 字符（完整提示词 ${fullText.length} 字符）`);
+    } else {
+      if (isDelta) {
+        /* 想发增量但没有可复用的会话 → 改发完整提示词（否则会丢上下文 ✗）。 */
+        text = guardChatgptPrompt(fullText);
+        logger.info(`[chatgpt] 无可复用会话 → 改发完整提示词 ${text.length} 字符`);
+      }
+      const isolated = await this.startNewChat(page);
+      if (!isolated) {
+        logger.warn('[chatgpt] 本轮未能切到干净的新对话（继续发送，但可能带上历史上下文）');
+      }
+    }
+    await this.waitForEditor(page);
 
     /* 发送前记基线：DOM 里只认**新出现的**答案（历史答案一直都在）。 */
     const baseline = await readDomAnswerState(page);
@@ -775,6 +1040,16 @@ export class ChatGptBrowserProvider extends BaseProvider {
       throw new PlatformUnavailableError(PLATFORM, '请求超过截止时间（deadline）');
     } finally {
       page.off('request', onRequest as never);
+      /* ⚠️ **在这里记录会话 URL**（2026-10-23 实测）：发送后 URL 变 `/c/<id>` 是异步的，
+       * 紧接着读会读到 `/`（`(新对话/首页)`）→ 下轮只能退回完整提示词 ✗。
+       * 本轮结束时导航必定已完成 ✓。 */
+      if (convRequestSeen) {
+        this.reuseSessionKey = sessionKey;
+        this.reuseConversationUrl = /\/c\//.test(page.url()) ? page.url() : '';
+        logger.info(
+          `[chatgpt] 会话标记：session=${sessionKey || '(空)'} → ${this.reuseConversationUrl || '(未记录)'}`,
+        );
+      }
     }
   }
 

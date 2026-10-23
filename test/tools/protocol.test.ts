@@ -5,6 +5,8 @@ import {
   TOOL_CALL_OPEN,
   buildToolProtocol,
   formatMessagesAsText,
+  buildToolTailReminder,
+  looksLikeToolRefusal,
   formatToolsAsText,
 } from '../../src/tools/protocol.js';
 import type { ChatMessage, ToolDefinition } from '../../src/types/message.js';
@@ -264,5 +266,89 @@ describe('formatMessagesAsText', () => {
 
   it('空列表返回空字符串', () => {
     expect(formatMessagesAsText([])).toBe('');
+  });
+});
+
+/**
+ * ⭐ 2026-10-23 真机实测（ChatGPT）：「模型把自己当成没有文件系统的聊天助手」。
+ *
+ * 用 xzh agent 走 chatgpt 平台时**完全不用工具** —— 原文：
+ * `当前运行环境中不存在目录 /home/amble/object/webaiapi，因此暂时无法列出该工作目录下的文件。`
+ * （0 个工具调用 ✗）
+ *
+ * 根因是**模型不服从协议**（它按"我无法访问本地文件"推理拒绝），不是格式不兼容。
+ * 在协议最前面加「你不是在回答问题 / 路径存不存在不归你判断 / 禁止说无法访问」之后，
+ * 同一请求立刻输出 `<tool_call>{"name":"list_dir",...}</tool_call>` ✓。
+ */
+describe('工具协议 —— 强约束（模型必须把自己当工具中间层）', () => {
+  const tools = [
+    {
+      type: 'function' as const,
+      function: {
+        name: 'list_dir',
+        description: '列出目录',
+        parameters: { type: 'object', properties: { target_directory: { type: 'string' } } },
+      },
+    },
+  ];
+
+  it('⭐ 协议开头必须声明「你不是在回答问题」', () => {
+    const text = formatToolsAsText(tools);
+    expect(text).toContain('你不是在回答问题');
+    expect(text.indexOf('你不是在回答问题')).toBeLessThan(text.indexOf('# 工具调用协议'));
+  });
+
+  it('⭐ 明确禁止「无法访问 / 目录不存在」，并声明路径存在性不归模型判断', () => {
+    const text = formatToolsAsText(tools);
+    expect(text).toContain('我无法访问');
+    expect(text).toContain('路径存不存在不是你判断的事');
+    expect(text).toContain('禁止');
+  });
+
+  it('⭐ 给出正例（可照抄的调用块）', () => {
+    const text = formatToolsAsText(tools);
+    expect(text).toContain('正例');
+    expect(text).toContain('<tool_call>');
+  });
+});
+
+/**
+ * ⭐ 2026-10-23 实测：走 chatgpt 时模型回「当前会话未提供可调用的项目文件编辑工具，尚未修改代码。」
+ * —— 协议在**开头**，它不认（历史里全是纯文本回答 + 头部会被截断/压缩）。
+ * 所以在提示词**末尾**再放一条极短的提醒。
+ */
+describe('buildToolTailReminder', () => {
+  it('⭐ 列出工具名 + 必须输出调用 + 禁止说「没有工具」', () => {
+    const text = buildToolTailReminder(['read_file', 'edit_file', 'bash']);
+    expect(text).toContain('本轮可用工具 3 个');
+    expect(text).toContain('read_file, edit_file, bash');
+    expect(text).toContain('<tool_call>');
+    expect(text).toContain('未提供工具');
+  });
+
+  it('没有工具时返回空串（不给提示词添噪音）', () => {
+    expect(buildToolTailReminder([])).toBe('');
+    expect(buildToolTailReminder(['', ''])).toBe('');
+  });
+});
+
+/**
+ * ⭐ 2026-10-23 用户实测：chatgpt 回「当前会话未提供可调用的项目文件编辑工具，尚未修改代码。」
+ * 这不是错误、是**拒答** —— failover 只在抛错时换平台，不识别就会把废话回给客户端 ✗。
+ */
+describe('looksLikeToolRefusal', () => {
+  it('⭐ 用户原话（未提供工具）→ 是拒答', () => {
+    expect(looksLikeToolRefusal('当前会话未提供可调用的项目文件编辑工具，尚未修改代码。')).toBe(true);
+  });
+
+  it('⭐ 「我无法访问本地文件」「请在终端自行执行」→ 是拒答', () => {
+    expect(looksLikeToolRefusal('我无法访问本地文件系统，建议你在终端里手动修改。')).toBe(true);
+    expect(looksLikeToolRefusal('请在终端自行执行这条命令。')).toBe(true);
+  });
+
+  it('正常回答 / 空文本 / 长文讨论 → 不算拒答（不误伤）', () => {
+    expect(looksLikeToolRefusal('好的，这是读取到的内容：第 1 行…')).toBe(false);
+    expect(looksLikeToolRefusal('')).toBe(false);
+    expect(looksLikeToolRefusal('关于「无法访问文件」这个报错，通常有三种原因：' + 'x'.repeat(500))).toBe(false);
   });
 });
