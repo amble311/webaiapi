@@ -29,6 +29,7 @@ import {
   type Request,
 } from 'playwright';
 
+import { resolveBrowserProxy } from './manager.js';
 import { expandHome, settings } from '../config.js';
 import { logger } from '../log/logger.js';
 import {
@@ -468,7 +469,12 @@ export class AuthCapture {
           '使用 Firefox 登录（默认；能过 Cloudflare Turnstile）。' +
             (profileDirRaw ? '持久化档案仅对 LOGIN_BROWSER=chrome 生效。' : ''),
         );
-        this.browser = await firefox.launch({ headless: this.headless });
+        /* ⚠️ 登录流程同样要显式传代理（Playwright 不读环境变量）✗ */
+        const loginProxy = resolveBrowserProxy();
+        this.browser = await firefox.launch({
+          headless: this.headless,
+          ...(loginProxy ? { proxy: { server: loginProxy } } : {}),
+        });
         this.context = await this.browser.newContext();
       } else if (profileDirRaw) {
         const profileDir = expandHome(profileDirRaw);

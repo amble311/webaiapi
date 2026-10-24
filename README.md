@@ -122,6 +122,9 @@ webaiapi logout chatglm --account acc2 --yes
 | `glm-4` / `glm-3` | ChatGLM 的具体模型别名 |
 
 > ⚠️ **`chatgpt` 需要能正常访问 `chatgpt.com` 的网络环境**（一般要代理/VPN）：
+> - **必须显式配置代理**：Playwright **不读** `HTTP_PROXY`/`HTTPS_PROXY` 环境变量，
+>   请在 `.env` 里设 `BROWSER_PROXY=http://127.0.0.1:7890`（留空则自动取环境变量）；
+>   不配代理时页面能打开但 `backend-api` 全失败 → 表现为「消息发出去了但永远没有回复」；
 > - 浏览器的出口必须能打开 `chatgpt.com`（Cloudflare / 风控对机房 IP 很敏感）；
 > - 登录用 **Firefox**（`LOGIN_BROWSER=firefox`，默认）—— 实测 Chromium/Playwright 过不了 Cloudflare 真人验证 ✗；
 > - **首次请求要等页面水合**（约 30~90s，算在 `REQUEST_TIMEOUT` 里），之后同一进程内会快；

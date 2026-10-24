@@ -184,6 +184,31 @@ async function injectPageScripts(target: Page): Promise<void> {
 }
 
 /** 关闭并清掉某个通道的 context / page。 */
+/**
+ * 解析浏览器代理：`BROWSER_PROXY` 优先，其次环境变量（HTTPS_PROXY / HTTP_PROXY / ALL_PROXY）。
+ *
+ * ⚠️ Playwright 的 `launch()` **不会**自动使用这些环境变量，必须显式传 `proxy` 选项。
+ */
+export function resolveBrowserProxy(): string {
+  try {
+    const fromSettings = String(
+      (settings as unknown as { browserProxy?: string }).browserProxy ?? '',
+    ).trim();
+    if (fromSettings) return fromSettings;
+  } catch {
+    // 忽略
+  }
+  const env = process.env;
+  return (
+    String(env['HTTPS_PROXY'] ?? '').trim() ||
+    String(env['https_proxy'] ?? '').trim() ||
+    String(env['HTTP_PROXY'] ?? '').trim() ||
+    String(env['http_proxy'] ?? '').trim() ||
+    String(env['ALL_PROXY'] ?? '').trim() ||
+    String(env['all_proxy'] ?? '').trim()
+  );
+}
+
 export async function disposeChannel(channelKey: string): Promise<void> {
   const ctx = channelContexts.get(channelKey);
   channelContexts.delete(channelKey);
@@ -427,7 +452,18 @@ export async function getBrowser(): Promise<SharedBrowser> {
 
     try {
       const { firefox } = await import('playwright');
-      browser = await firefox.launch({ headless, slowMo: 0 });
+      /* ⚠️⚠️ 2026-10-24 定位的关键问题：Playwright **不读** HTTP_PROXY/HTTPS_PROXY 环境变量 ✗
+       * —— 不显式传 proxy 就是**直连**：页面能开，但 backend-api 全失败 →
+       * ChatGPT 退化到离线模式（`local-chatgpt:` 本地会话、后端 404、永远没回答）✗。
+       * 表现：「网页里手动发消息正常，自动化发的永远不回复」。 */
+      const proxy = resolveBrowserProxy();
+      browser = await firefox.launch({
+        headless,
+        slowMo: 0,
+        ...(proxy ? { proxy: { server: proxy } } : {}),
+      });
+      if (proxy) logger.info(`浏览器代理: ${proxy}`);
+      else logger.warn('浏览器未使用代理（若 chatgpt.com 需要代理，后端请求会全部失败）');
 
       context = await browser.newContext({
         viewport: { width: 1920, height: 1080 },

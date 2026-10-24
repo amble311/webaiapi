@@ -204,12 +204,18 @@ export function extractChatgptSse(raw: string): ChatgptSseResult {
     const author = (message['author'] ?? {}) as Json;
     if (author['role'] !== 'assistant') continue;
     const { text, thoughts } = textOf(message);
-    if (text) answer = text;
+    const contentType = String((message['content'] as Json | undefined)?.['content_type'] ?? '');
+    /* ⚠️⚠️⚠️ 2026-10-24 实测：**只有 `content_type === "text"` 的消息才是正文**。
+     * 旧代码是 `if (text) answer = text` —— 会被 `thoughts` / `reasoning_recap` /
+     * `code` 这些消息的片段**覆盖** ✗（实测答案变成「我检查了你给出的项目路径 `/…」
+     * 这半句，只有 15 字符，真正的 `<tool_call>` 被吞掉 ✗）。 */
+    if (contentType === 'text' && text && !/^\s*<text>\s*$/i.test(text)) {
+      answer = text;
+    }
     if (thoughts) thinking = thoughts;
     /* ⚠️⚠️ 只有 **content_type === "text"** 的助手消息才算「说完了」
      * （2026-10-21 实测：`model_editable_context` 那条 assistant 消息也带
      *  `finished_successfully` + `end_turn: true` → 早退 → 正文只拿到开头 6 个字 ✗）。 */
-    const contentType = String((message['content'] as Json | undefined)?.['content_type'] ?? '');
     if (
       contentType === 'text' &&
       message['status'] === 'finished_successfully' &&

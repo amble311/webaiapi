@@ -352,3 +352,35 @@ describe('looksLikeToolRefusal', () => {
     expect(looksLikeToolRefusal('关于「无法访问文件」这个报错，通常有三种原因：' + 'x'.repeat(500))).toBe(false);
   });
 });
+
+/**
+ * ⭐ 2026-10-24 实测：用户问「当前项目的前端是什么结构」这类**问句**时，
+ * chatgpt 会直接回「当前环境中未能读取到 … 项目文件」✗（不调工具）。
+ * 协议里必须把「问句也要先读」讲死，并把这种措辞识别为**软拒绝**。
+ */
+describe('问句也要先调工具（2026-10-24 实测）', () => {
+  const tools = [
+    {
+      type: 'function' as const,
+      function: { name: 'read_file', description: '读', parameters: { type: 'object', properties: { path: { type: 'string' } } } },
+    },
+  ];
+
+  it('⭐ 协议明确要求：涉及本项目信息时先调工具（含问句）', () => {
+    const text = formatToolsAsText(tools, { workspacePath: '/x' });
+    expect(text).toContain('这个项目是什么结构');
+    expect(text).toContain('禁止直接回答「未能读取到');
+  });
+
+  it('⭐ 尾部提醒也带这条约束', () => {
+    expect(buildToolTailReminder(['read_file'])).toContain('必须先调用工具读取');
+  });
+
+  it('⭐ 「当前环境中未能读取到 … 项目文件」要被识别为软拒绝', () => {
+    expect(
+      looksLikeToolRefusal(
+        '当前环境中未能读取到 /home/amble/object/xzh 项目文件，因此暂时无法准确判断前端的目录结构、技术栈和页面组织方式。',
+      ),
+    ).toBe(true);
+  });
+});

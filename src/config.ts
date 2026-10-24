@@ -70,6 +70,19 @@ export interface Settings {
    * 浏览器就等于每次都要先登 Google，再登 ChatGPT ✗。持久化档案把这些登录态保留下来，
    * 一次登录长期有效。空字符串 = 每次都开空白档案（旧行为）。
    */
+  /**
+   * 浏览器（Playwright）使用的**代理**，如 `http://127.0.0.1:10808`。
+   *
+   * ⚠️⚠️ 2026-10-24 定位到的关键问题：Playwright 的 `firefox.launch()` **不读**
+   * HTTP_PROXY / HTTPS_PROXY 环境变量 ✗ —— 浏览器会**直连**：
+   * 页面能打开，但 `backend-api` 请求全部失败 → ChatGPT 退化成**离线模式**
+   * （生成 `local-chatgpt:` 本地会话、消息只在前端、后端 404、永远没有回答 ✗）。
+   * 表现就是「手动在浏览器里发消息正常，自动化发的永远不回复」。
+   *
+   * 留空 = 自动取环境变量 HTTPS_PROXY / HTTP_PROXY / ALL_PROXY（都没有才直连）。
+   */
+  browserProxy: string;
+
   browserProfileDir: string;
 
   /**
@@ -115,6 +128,7 @@ const ENV_KEYS: Record<string, keyof Settings> = {
   TOOL_STALL_ROUNDS: 'toolStallRounds',
   TOOL_ROUND_HARD_LIMIT: 'toolRoundHardLimit',
   LOGIN_BROWSER: 'loginBrowser',
+  BROWSER_PROXY: 'browserProxy',
   BROWSER_PROFILE_DIR: 'browserProfileDir',
   BROWSER_CDP_ENDPOINT: 'browserCdpEndpoint',
   API_KEYS: 'apiKeys',
@@ -165,6 +179,7 @@ const DEFAULTS: Settings = {
   toolStallRounds: 3,
   toolRoundHardLimit: 150,
   loginBrowser: 'firefox',
+  browserProxy: '',
   browserProfileDir: '~/.ai-api/browser/login-profile',
   browserCdpEndpoint: '',
   apiKeys: '',

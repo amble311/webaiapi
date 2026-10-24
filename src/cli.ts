@@ -29,6 +29,8 @@ import { settings } from './config.js';
 import { ensureFirefox, MANUAL_INSTALL_HINT } from './browser/ensure-firefox.js';
 import { listAccounts, loadAuth } from './browser/credentials.js';
 import { PLATFORM_IDS, PLATFORM_LIST } from './browser/platforms.js';
+import { deleteChatgptMemory, listChatgptMemories } from './browser/chatgpt-memories.js';
+import { disposeSharedBrowser } from './browser/manager.js';
 import { logger } from './log/logger.js';
 import { padDisplay } from './utils/prompt.js';
 
@@ -107,6 +109,7 @@ webaiapi —— 把 AI 聊天网页包装成 OpenAI 兼容接口
   webaiapi stop                                   停止服务（读 start 写的 PID 文件；--force 强杀）
   webaiapi model                                  可用模型 id 与配置建议（配客户端前先看它）
   webaiapi accounts                               账号与角色（多账号是否生效的权威视图）
+  webaiapi chatgpt-memories [--clear]             查看/清理 ChatGPT「记忆」（跨对话污染源）
   webaiapi status                                 运行状态（模型路由 / 辅助通道 / 请求池）
   webaiapi health                                 健康检查（各平台登录状态）
   webaiapi doctor                                 自检（Node / Firefox / 凭证 / 端口）
@@ -439,6 +442,63 @@ async function cmdAccounts(): Promise<number> {
   return 0;
 }
 
+/**
+ * `webaiapi chatgpt-memories` —— 查看/清理 ChatGPT 的「记忆」。
+ *
+ * ⚠️ 为什么需要（2026-10-24 用户实测）：设置里关掉「启用记忆」只停止**新增** ✗，
+ * 「已保存的记忆」照旧作用于每一轮回答 → 在 btc 项目里答出 xzh 的内容。
+ * 默认**只列不删**；删必须显式 `--clear`（这是用户的个人数据）。
+ */
+async function cmdChatgptMemories(flags: Record<string, string | boolean>): Promise<number> {
+  const accountId = typeof flags['account'] === 'string' ? flags['account'] : 'chatgpt';
+  const shouldClear = Boolean(flags['clear']);
+
+  console.log(`读取 ChatGPT 记忆（账号 ${accountId}）…`);
+  try {
+    return await runChatgptMemories(accountId, shouldClear);
+  } finally {
+    /* ⚠️ 必须释放浏览器，否则 Node 事件循环被浏览器拖住（命令不返回） */
+    await disposeSharedBrowser().catch(() => undefined);
+  }
+}
+
+/** `chatgpt-memories` 的实现主体（包一层便于统一释放浏览器）。 */
+async function runChatgptMemories(accountId: string, shouldClear: boolean): Promise<number> {
+  const items = await listChatgptMemories(accountId);
+  if (items === null) {
+    console.error('✗ 取不到记忆列表（未登录 / 网络不通 / 页面未就绪）。先跑 `webaiapi login chatgpt`。');
+    return 1;
+  }
+  if (items.length === 0) {
+    console.log('✓ 没有已保存的记忆（不会再跨对话影响回答）。');
+    return 0;
+  }
+
+  console.log(`\n发现 ${items.length} 条记忆：`);
+  items.forEach((m, i) => {
+    const status = m.status ? `[${m.status}] ` : '';
+    console.log(`  ${String(i + 1).padStart(2)}. ${status}${m.content.slice(0, 100)}`);
+  });
+
+  if (!shouldClear) {
+    console.log('\n（只读）要清空它们请加 --clear：webaiapi chatgpt-memories --clear');
+    return 0;
+  }
+
+  console.log('\n开始删除…');
+  let ok = 0;
+  for (const m of items) {
+    if (!m.id) continue;
+    const deleted = await deleteChatgptMemory(accountId, m.id);
+    if (deleted) ok += 1;
+    process.stdout.write(deleted ? '.' : 'x');
+  }
+  console.log(`\n\n删除完成：${ok}/${items.length} 成功。`);
+  const left = await listChatgptMemories(accountId);
+  if (left) console.log(`复查：还剩 ${left.length} 条记忆。`);
+  return ok === items.length ? 0 : 1;
+}
+
 /** `health` 子命令。 */
 async function cmdHealth(): Promise<number> {
   // ⚠️ /health 会启动浏览器探测登录态，首次可能要 20s+，不能用短超时
@@ -616,6 +676,11 @@ export async function runCli(argv: ReadonlyArray<string> = process.argv): Promis
 
     case 'accounts':
       return cmdAccounts();
+
+    /* `webaiapi chatgpt-memories`：查看/清理 ChatGPT「记忆」。
+     * ⚠️ 关掉设置里的「启用记忆」只停止**新增**，旧记忆**仍然生效**（2026-10-24 实测）。 */
+    case 'chatgpt-memories':
+      return cmdChatgptMemories(flags);
 
     /* `webaiapi model`：展示当前可用模型 id + 配置建议
      * （与 `/v1/models` 共用 `controllers/model-catalog.ts`，避免两处走散）。 */

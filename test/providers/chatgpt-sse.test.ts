@@ -123,3 +123,54 @@ describe('ChatGptBrowserProvider（可测部分）', () => {
     expect(PLATFORMS_WITH_PROVIDER).toContain('chatgpt');
   });
 });
+
+/**
+ * ⭐ 2026-10-24 实测：后端接口返回的工具调用正文被 `<escape>` 包裹，
+ * 解析器能取出调用，但剩余正文会留下 `<escape></escape>` 残渣 ✗ → 必须剥掉。
+ */
+describe('stripChatgptArtifacts', () => {
+  it('剥掉 escape 包裹，工具调用块本身不动', async () => {
+    const { stripChatgptArtifacts } = await import('../../src/providers/chatgpt.js');
+    const raw = '<escape><tool_call>{"name":"read_file"}</tool_call></escape>';
+    expect(stripChatgptArtifacts(raw)).toBe('<tool_call>{"name":"read_file"}</tool_call>');
+  });
+
+  it('大写的 ESCAPE 也认；普通文本不受影响', async () => {
+    const { stripChatgptArtifacts } = await import('../../src/providers/chatgpt.js');
+    expect(stripChatgptArtifacts('<ESCAPE>你好</ESCAPE>')).toBe('你好');
+    expect(stripChatgptArtifacts('就是普通回答')).toBe('就是普通回答');
+  });
+});
+
+/**
+ * ⭐⭐ 2026-10-24 实测：旧代码 `if (text) answer = text` 会被 thoughts / reasoning_recap
+ * 的片段**覆盖** ✗ —— 实测答案退化成「我检查了你给出的项目路径 `/…」（15 字符），
+ * `<tool_call>` 被吞掉。只有 content_type === "text" 才是正文。
+ */
+describe('thoughts 不能覆盖正文', () => {
+  it('⭐ thoughts 的片段不覆盖最终 text', () => {
+    const raw = [
+      'event: delta',
+      'data: {"v":{"message":{"id":"m1","author":{"role":"assistant"},"content":{"content_type":"thoughts","parts":["我检查了你给出的项目路径 `/"]},"status":"finished_successfully","end_turn":false}}}',
+      '',
+      'event: delta',
+      'data: {"v":{"message":{"id":"m2","author":{"role":"assistant"},"content":{"content_type":"text","parts":["<tool_call>{\\"name\\":\\"list_dir\\"}</tool_call>"]},"status":"finished_successfully","end_turn":true}}}',
+    ].join('\n');
+
+    const r = extractChatgptSse(raw);
+    expect(r.answer).toContain('<tool_call>');
+    expect(r.answer).not.toContain('我检查了你给出的项目路径');
+    expect(r.finished).toBe(true);
+  });
+
+  it('⭐ 最终正文只是占位符 <text> 时，不当作正文', () => {
+    const raw = [
+      'event: delta',
+      'data: {"v":{"message":{"id":"m1","author":{"role":"assistant"},"content":{"content_type":"code","parts":[]},"status":"finished_successfully","end_turn":false}}}',
+      '',
+      'event: delta',
+      'data: {"v":{"message":{"id":"m2","author":{"role":"assistant"},"content":{"content_type":"text","parts":["<text>"]},"status":"finished_successfully","end_turn":true}}}',
+    ].join('\n');
+    expect(extractChatgptSse(raw).answer).toBe('');
+  });
+});

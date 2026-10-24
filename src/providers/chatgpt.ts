@@ -25,6 +25,7 @@ import { STEALTH_JS } from '../browser/stealth.js';
 import { disposeChannel, getChannelPage, loadCookies, peekPage } from '../browser/manager.js';
 import { PlatformUnavailableError } from '../utils/errors.js';
 import { BaseProvider, type ChatRequest, type ChatResponse } from './base.js';
+import { extractChatgptSse } from './chatgpt-sse.js';
 
 const PLATFORM = 'chatgpt';
 const HOME_URL = 'https://chatgpt.com/';
@@ -46,7 +47,10 @@ const EDITOR_WAIT_MS = 100_000;
 /** 编辑器等待期间的进度日志间隔。 */
 const EDITOR_PROGRESS_MS = 15_000;
 /** 轮询间隔。 */
-const POLL_MS = 700;
+/* 轮询间隔：**1000ms**。
+ * ⚠️ 2026-10-24 实测：改成 250ms 反而更糟 —— 生成期间页面内 fetch 会挂住，
+ * 轮询越密堆积越多（每次 fetch 已加 2.5s 独立超时）。1s 一轮既够快又不堆积。 */
+const POLL_MS = 1_000;
 /** 多久没有任何新内容就判定卡住。 */
 const IDLE_TIMEOUT_MS = 120_000;
 
@@ -138,7 +142,171 @@ async function countMemories(page: Page): Promise<number> {
   }
 }
 
-/** 读一段页面文本的脚本（函数表达式，交给 iife 包装）。 */
+/**
+ * 发送前把 `<tool_call>` 换成**安全标记**。
+ *
+ * ⚠️⚠️⚠️ 2026-10-24 真机 A/B 定位到的根因：
+ *   A) 短消息 + `<tool_call>{...}</tool_call>`  → **120 秒没有任何回复** ✗
+ *   B) 同样措辞但不含该标签（"你是 API 后端的工具调用层"） → 15 秒正常回复 ✓
+ *   → ChatGPT 把 `<tool_call>` 当成**伪造工具调用 / 注入**，**静默拒答** ✗
+ * 所以 chatgpt 平台发送前换成 `[TOOL_CALL]` / `[/TOOL_CALL]`，收到回复再换回来 ✓。
+ * 只影响 chatgpt（其它平台仍用原生 `<tool_call>`）。
+ */
+export function sanitizePromptForChatgpt(prompt: string): string {
+  return String(prompt ?? '')
+    .replace(/<\/?tool_call>/gi, (m) => (m.startsWith('</') ? '[/TOOL_CALL]' : '[TOOL_CALL]'))
+    .replace(/<\/?escape>/gi, '');
+}
+
+/** 把模型回复里的安全标记换回真实的 `<tool_call>`（解析器要用）。 */
+export function restoreToolTags(text: string): string {
+  return String(text ?? '')
+    .replace(/\[\/?TOOL_CALL\]/gi, (m) => (m.startsWith('[/') ? '</tool_call>' : '<tool_call>'));
+}
+
+/**
+ * 去掉 ChatGPT 正文里的 `<escape>` 包裹标签。
+ *
+ * ⚠️ 2026-10-24 实测：后端接口返回的工具调用正文长这样
+ * `<escape><tool_call>{…}</tool_call></escape>` —— 解析器能取出工具调用 ✓，
+ * 但**剩余正文**会留下 `<escape></escape>` 残渣 ✗（客户端会原样显示）。
+ */
+export function stripChatgptArtifacts(text: string): string {
+  return String(text ?? '')
+    .replace(/<\/?escape>/gi, '')
+    /* ⚠️ 2026-10-24 实测：模型用自带代码解释器时，最终文本只有一个占位符 `<text>` ✗ */
+    .replace(/^\s*<\/?text>\s*$/i, '')
+    .replace(/<\/?text>/gi, '')
+    .trim();
+}
+
+/** 从当前页面 URL 取会话 id（`/c/<uuid>`）；不在会话页则返回空串。 */
+function readConversationId(page: Page): string {
+  const match = /\/c\/([0-9a-f-]{8,})/i.exec(page.url());
+  return match?.[1] ?? '';
+}
+
+/**
+ * **从后端接口读本轮回复**（这是 2026-10-24 实测后的正解）。
+ *
+ * ⚠️⚠️ 为什么不再只靠 DOM：实测页面（前端）经常**卡在转圈、一直不渲染内容** ✗，
+ * 但后端**其实已经生成好了** —— 同一条会话用 `GET /backend-api/conversation/<id>`
+ * 能读到完整回复（那次正是 `read_file` 的工具调用），而 DOM 里 `ChatGPT said:` 一个字都没有 ✗。
+ * 所以我们以接口为准：不依赖水合、不依赖渲染、也不依赖 DOM 结构改版。
+ *
+ * @returns `null` = 接口暂时取不到（调用方退回读 DOM）
+ */
+let apiWarned = false;
+
+async function readAnswerViaApi(
+  page: Page,
+  conversationId: string,
+): Promise<{ text: string; finished: boolean; count: number; usedOwnTools: boolean; status: number } | null> {
+  try {
+    const result = await evaluateFn<{
+      ok: boolean;
+      status?: number;
+      text?: string;
+      finished?: boolean;
+      count?: number;
+      usedOwnTools?: boolean;
+      err?: string;
+    }>(
+      page,
+      `async () => {
+  /* ⚠️⚠️ 2026-10-24 实测：生成期间页面内 fetch **会一直挂着不返回** ✗ ——
+   * 250ms 一轮的轮询越积越多，最后一律超时。必须给每次请求**独立超时**。 */
+  const withTimeout = (url, opts, ms) => {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), ms);
+    return fetch(url, Object.assign({}, opts, { signal: ctl.signal })).finally(() => clearTimeout(timer));
+  };
+
+  try {
+    const s = await withTimeout('https://chatgpt.com/api/auth/session', { credentials: 'include' }, 2500);
+    if (!s.ok) return { ok: false, status: s.status };
+    const sd = await s.json();
+    const token = String((sd && sd.accessToken) || '');
+    if (!token) return { ok: false };
+
+    const res = await withTimeout('https://chatgpt.com/backend-api/conversation/' + ${JSON.stringify(conversationId)}, {
+      headers: { authorization: 'Bearer ' + token, accept: 'application/json' },
+      credentials: 'include',
+    }, 2500);
+    if (!res.ok) return { ok: false, status: res.status };
+    const body = await res.json();
+
+    const mapping = body && body.mapping ? body.mapping : {};
+    const nodes = Object.keys(mapping).map((k) => mapping[k]);
+    const messages = nodes.map((n) => n && n.message).filter(Boolean);
+
+    /* 2026-10-24 实测：模型有时不用我们的工具，而是用 ChatGPT 自带的代码解释器
+     * （content_type=code + role=tool 的 execution_output）→ 最终文本只有占位符 text。
+     * 判据：最后一条 user 消息之后出现 code / execution_output。
+     * 注意：本段在 TS 模板字符串里，注释中不许出现反引号。 */
+    let lastUserIdx = -1;
+    messages.forEach((m, i) => {
+      if (m.author && m.author.role === 'user') lastUserIdx = i;
+    });
+    const usedOwnTools = messages.slice(lastUserIdx + 1).some((m) => {
+      const ct = String((m.content && m.content.content_type) || '');
+      const role = String((m.author && m.author.role) || '');
+      return ct === 'code' || ct === 'execution_output' || role === 'tool';
+    });
+    // 只认**助手 + 文本**消息（tool 结果、model_editable_context 都不算）
+    const textMsgs = messages.filter((m) => {
+      const role = m.author && m.author.role;
+      const ct = m.content && m.content.content_type;
+      return role === 'assistant' && ct === 'text';
+    });
+    if (textMsgs.length === 0) return { ok: true, text: '', finished: false, count: 0 };
+
+    const last = textMsgs[textMsgs.length - 1];
+    const parts = (last.content && last.content.parts) || [];
+    const text = parts.filter((x) => typeof x === 'string').join('').replace(/<\/?escape>/gi, '');
+    return {
+      ok: true,
+      text,
+      finished: String(last.status || '') === 'finished_successfully',
+      count: textMsgs.length,
+      usedOwnTools,
+    };
+  } catch (e) {
+    return { ok: false, status: -1, err: String(e).slice(0, 120) };
+  }
+}`,
+    ).catch(() => null);
+
+    if (!result || !result.ok) {
+      /* ⚠️ 404 = **这条会话在服务端根本不存在**（前端乐观显示，POST 没落地）✗。
+       * 用特殊返回值让调用方能识别并重发。 */
+      if (Number(result?.status) === 404) {
+        return { text: '', finished: false, count: 0, usedOwnTools: false, status: 404 };
+      }
+      /* 只在第一次失败时打日志（轮询很密，别刷屏）。 */
+      if (!apiWarned) {
+        apiWarned = true;
+        logger.warn(
+          `[chatgpt] 接口读取失败（会话 ${conversationId.slice(0, 8)}…，status=${result?.status ?? '?'}` +
+            `${result?.err ? `，${result.err}` : ''}）→ 走兜底`,
+        );
+      }
+      return null;
+    }
+    return {
+      text: String(result.text ?? ''),
+      finished: Boolean(result.finished),
+      count: Number(result.count ?? 0),
+      usedOwnTools: Boolean(result.usedOwnTools),
+      status: Number(result.status ?? 200),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 读页面文本的脚本（函数表达式，交给 iife 包装）。 */
 const READ_DOM_TEXT_JS = `() => {
   /* ⚠️⚠️ 2026-10-22 真机实测（两轮）：用"整个 body 的文本"提取会被**页面噪音**污染 ✗ ——
    * 第一版拿到的是 "ChatGPT is responding…You're using the free version of ChatGPT…Try Plus free"，
@@ -434,6 +602,8 @@ export class ChatGptBrowserProvider extends BaseProvider {
 
   /** 上一次成功发送时所属的**逻辑会话**（`session_key`）与它的网页会话 URL。
    * 两者都匹配时才复用（只发增量）；否则开新对话 + 发完整提示词。 */
+  /** 本页是否已经就绪过一次（之后就绪不再等 networkidle，省 20s）。 */
+  private editorReadyOnce = false;
   private reuseSessionKey = '';
   private reuseConversationUrl = '';
 
@@ -598,9 +768,15 @@ export class ChatGptBrowserProvider extends BaseProvider {
       ).catch(() => false);
       if (has) {
         /* ⚠️ 编辑器出现 ≠ 页面可用（2026-10-22 用户实测：控件有了但要挺久才真正就绪 ✗）。
-         * 用「网络静默」作为水合完成的代理信号，再补 1.5s 余量。 */
-        await page.waitForLoadState('networkidle', { timeout: 20_000 }).catch(() => undefined);
-        await sleep(1500);
+         * 首次就绪用「网络静默」作代理信号；**之后切新对话不再等**——
+         * 2026-10-24 实测：`networkidle` 在繁忙页面上经常耗满 20s ✗（发送总耗时 64s 里 20s 是它）。 */
+        if (!this.editorReadyOnce) {
+          await page.waitForLoadState('networkidle', { timeout: 20_000 }).catch(() => undefined);
+          await sleep(1000);
+          this.editorReadyOnce = true;
+        } else {
+          await sleep(300);
+        }
         return;
       }
       /* 卡满 60s 还没编辑器 → 重载一次（一次性，避免无限刷） */
@@ -873,7 +1049,10 @@ export class ChatGptBrowserProvider extends BaseProvider {
    * 轮询页面，增量吐出；页脚出现 `Response complete` 才结束（这是 ChatGPT 自己的完成标记）。
    */
   async *chatStream(request: ChatRequest): AsyncGenerator<ChatResponse> {
+    const tEnter = Date.now();
     const page = await this.ensurePage();
+    const tReady = Date.now();
+    logger.info(`[chatgpt] 页面就绪 ${((tReady - tEnter) / 1000).toFixed(1)}s`);
 
     /* ⭐ **按会话复用**（2026-10-23 用户要求：每次新对话会逼 agent 重发完整历史，太浪费上下文）：
      * 同一个 `session_key` 且页面仍停在那条网页会话上 → **只发增量**（网页自己记得上文）；
@@ -891,7 +1070,8 @@ export class ChatGptBrowserProvider extends BaseProvider {
       this.reuseConversationUrl !== '' &&
       page.url() === this.reuseConversationUrl;
 
-    let text = guardChatgptPrompt(request.message);
+    /* ⚠️ chatgpt 会把 `<tool_call>` 当伪造工具调用而**静默拒答** ✗（真机 A/B 验证）→ 换成安全标记。 */
+    let text = sanitizePromptForChatgpt(guardChatgptPrompt(request.message));
 
     if (canReuse) {
       logger.info(`[chatgpt] 复用同一网页会话，只发增量 ${text.length} 字符（完整提示词 ${fullText.length} 字符）`);
@@ -910,6 +1090,12 @@ export class ChatGptBrowserProvider extends BaseProvider {
 
     /* 发送前记基线：DOM 里只认**新出现的**答案（历史答案一直都在）。 */
     const baseline = await readDomAnswerState(page);
+    /* ⚠️ 复用会话时，接口里的「最后一条助手文本消息」可能是**上一轮**的答案 ✗ →
+     * 先记下条数，只认**新增**的那条。 */
+    const baselineConvId = readConversationId(page);
+    const baselineCount = baselineConvId
+      ? ((await readAnswerViaApi(page, baselineConvId))?.count ?? 0)
+      : 0;
 
     /* ⚠️ 发送必须**校验真的发出去了**（页面控件出现 ≠ 可用；水合没完成时点 Send 是空操作 ✗）。 */
     let convRequestSeen = false;
@@ -921,6 +1107,28 @@ export class ChatGptBrowserProvider extends BaseProvider {
       }
     };
     page.on('request', onRequest as never);
+
+    /* ⭐ 第二来源：直接读 SSE 响应体（2026-10-24 实测：接口 GET 偶尔持续 403/超时，
+     * 但 SSE 响应体里**一定**有完整内容）。三路兜底：接口 → SSE → DOM。 */
+    const sseBodies: string[] = [];
+    const onResponse = (response: {
+      url: () => string;
+      headers: () => Record<string, string>;
+      text: () => Promise<string>;
+    }): void => {
+      try {
+        if (!/backend-api\/(?:f\/)?conversation(?:\?|$)/.test(response.url())) return;
+        const ct = String(response.headers()['content-type'] ?? '');
+        if (!ct.includes('event-stream')) return;
+        void response
+          .text()
+          .then((body) => sseBodies.push(body))
+          .catch(() => undefined);
+      } catch {
+        // 忽略
+      }
+    };
+    page.on('response', onResponse as never);
 
     try {
       let sent = false;
@@ -954,40 +1162,176 @@ export class ChatGptBrowserProvider extends BaseProvider {
         throw failure;
       }
 
+      /* ⭐⭐ **从后端接口读答案**（2026-10-24 实测后的正解）：
+       * 前端页面经常**卡在转圈、一直不渲染内容** ✗，但后端**其实已经生成好了** ——
+       * 实测那条会话在后端有完整回复（`<tool_call>{"name":"read_file",…}</tool_call>`），
+       * 而 DOM 里 `ChatGPT said:` 一个字都没有 ✗。
+       * 所以以 `GET /backend-api/conversation/<id>` 为准，DOM 只在接口取不到时兜底。 */
       const startedAt = Date.now();
+      logger.info(
+        `[chatgpt] 发送完成 ${((startedAt - tEnter) / 1000).toFixed(1)}s（其中页面就绪 ${((tReady - tEnter) / 1000).toFixed(1)}s）`,
+      );
       const deadline = Math.min(
         request.deadlineTs ?? Number.POSITIVE_INFINITY,
         startedAt + 10 * 60_000,
       );
+
+      /* 会话 id：发送后 URL 变成 `/c/<id>` 是**异步**的 → 轮询等它。 */
+      /* 会话 id：优先从 URL 取（发送后变 `/c/<id>`，异步）；
+       * ⚠️ 拿不到时**从 SSE 里取**（流里带 `conversation_id`）——2026-10-24 实测
+       * 页面水合慢时 URL 迟迟不变，但流里早就有 id ✗。 */
+      let convId = readConversationId(page);
+      const idDeadline = Date.now() + 20_000;
+      while (!convId && Date.now() < idDeadline) {
+        await sleep(400);
+        convId = readConversationId(page);
+        if (!convId && sseBodies.length > 0) {
+          convId = extractChatgptSse(sseBodies.join('\n')).conversationId || '';
+        }
+      }
+      if (!convId) {
+        const failure = new PlatformUnavailableError(
+          PLATFORM,
+          '发送后拿不到会话 id（页面可能还停在首页）→ 稍后重试',
+        );
+        await captureFailureSnapshot(
+          page,
+          'chatgpt.conv.no-id',
+          { model: PLATFORM, accountId: this.accountId, extra: { convRequestSeen } },
+          failure,
+        );
+        throw failure;
+      }
+      /* ⚠️⚠️ 2026-10-24 实测：界面上的用户消息可能是**前端乐观显示**的 ——
+       * `GET /backend-api/conversation/<id>` 直接 **404（服务端根本没有这条会话）** ✗
+       * （截图里"只有提问、没有回答、下面还挂了广告"就是这种状态）。
+       * 所以发送后必须**校验会话真的存在**，不存在就重发一次。 */
+      let existsStatus = 0;
+      const existDeadline = Date.now() + 8_000;
+      while (Date.now() < existDeadline) {
+        const probe = await readAnswerViaApi(page, convId);
+        existsStatus = probe?.status ?? 0;
+        if (existsStatus !== 0 && existsStatus !== 404) break;
+        await sleep(600);
+      }
+      if (existsStatus === 404) {
+        logger.warn('[chatgpt] 会话未落到服务端（404）→ 重发一次');
+        try {
+          await this.startNewChat(page);
+          await this.waitForEditor(page);
+          await this.sendMessage(page, text);
+          const newIdDeadline = Date.now() + 20_000;
+          let newId = '';
+          while (!newId && Date.now() < newIdDeadline) {
+            await sleep(400);
+            newId = readConversationId(page);
+          }
+          if (newId) convId = newId;
+        } catch (resendError) {
+          logger.warn(`[chatgpt] 重发失败: ${String(resendError).slice(0, 120)}`);
+        }
+      }
+      logger.info(`[chatgpt] 会话 ${convId.slice(0, 8)}… 就绪（status=${existsStatus}）→ 轮询后端回复`);
+
       let emitted = '';
       let lastGrowth = Date.now();
-      let sawNewAnswer = false;
+      let usedApi = false;
+      /* ⚠️ 模型用了 ChatGPT 自带的代码解释器（而不是我们的工具）→ 记录下来快速失败。 */
+      let ownToolsAt = 0;
+      /** 是否退回到「读 DOM」这条兜底路径。 */
+      let usedDom = false;
+      /** DOM 文本最后一次变化的时刻（稳定判定用；DOM 的 complete 可能早于文本写完 ✗）。 */
+      let domChangedAt = Date.now();
+      let lastDomText = '';
 
       while (Date.now() < deadline) {
         await sleep(POLL_MS);
-        const state = await readDomAnswerState(page);
 
-        /* 等新答案出现：DOM 可能还停在上一轮的文本（与基线相同）→ 先别吐。 */
-        if (process.env['CHATGPT_DEBUG_DOM'] === '1') {
+        const fromApi = await readAnswerViaApi(page, convId);
+        let text = '';
+        let finished = false;
+
+        if (fromApi) {
+          usedApi = true;
+          if (fromApi.usedOwnTools && ownToolsAt === 0) {
+            ownToolsAt = Date.now();
+            logger.warn('[chatgpt] 模型在使用自带代码解释器（未按协议调用我们的工具）');
+          }
+          /* 只认**本轮新增**的助手消息（count > 基线），否则会把上一轮答案当本轮 ✗。 */
+          if (fromApi.count > baselineCount) {
+            text = fromApi.text;
+            finished = fromApi.finished;
+          }
+        }
+
+        if (process.env['CHATGPT_DEBUG_TAP'] === '1') {
           logger.info(
-            `[chatgpt:dom] text=${state.text.length} raw=${state.rawLen ?? 0} marker=${state.hasMarker ? 'y' : 'n'} complete=${state.complete} generating=${state.generating} baseline=${baseline.text.length}`,
+            `[chatgpt:tap] api=${fromApi ? 'y' : 'n'} sseN=${sseBodies.length} ` +
+              `sseLen=${sseBodies.reduce((n, b) => n + b.length, 0)} ` +
+              `sseDone=${sseBodies.some((b) => b.includes('[DONE]')) ? 'y' : 'n'} ` +
+              `emitted=${emitted.length}`,
           );
         }
 
-        if (!sawNewAnswer) {
-          if (state.text.length > 0 && state.text !== baseline.text) sawNewAnswer = true;
-          else continue;
+        /* ⭐⭐ **SSE 收到 `[DONE]` = 生成结束** → 此时**再用接口取一次**（最可靠）。
+         * ⚠️ 2026-10-24 实测两条教训：
+         * ① 生成**期间**接口一直失败（`status=?`），只有结束后才 200 ✓；
+         * ② 直接解析 SSE 会拿到**中间那条 thoughts 消息**（"我检查了你给出的项目路径 `/…"
+         *    只有 15 字符 ✗），不是最终答案。
+         * 所以顺序是：接口 → （`[DONE]` 后）接口 → SSE → DOM。 */
+        /* ⚠️⚠️ 2026-10-24 实测结论（用 39KB 原始流验证过）：
+         * 通过 `page.on('response')` + `resp.text()` 抓到的 SSE **经常是半截** ✗
+         * （那次体里根本没有模型的回答，`list_dir` 的 9 次匹配全来自我们自己的提示词）。
+         * 而**事后查接口** `GET /backend-api/conversation/<id>` 能拿到完整答案 ✓
+         * （生成期间接口会失败，结束后才 200）。
+         * 所以：**只信接口**，DOM 仅在「接口一直没成功、且 DOM 明确 complete」时兜底。
+         * SSE 仍抓（用于诊断），但**不再作为答案来源** ✗。 */
+        if (process.env['CHATGPT_DEBUG_TAP'] === '1') {
+          logger.info(
+            `[chatgpt:tap] api=${fromApi ? 'y' : 'n'} sseN=${sseBodies.length} ` +
+              `sseLen=${sseBodies.reduce((n, b) => n + b.length, 0)} emitted=${emitted.length}`,
+          );
         }
 
-        if (state.text.length > emitted.length) {
-          const delta = state.text.slice(emitted.length);
-          emitted = state.text;
+        if (fromApi && fromApi.count > baselineCount && fromApi.text) {
+          usedApi = true;
+          text = fromApi.text;
+          finished = fromApi.finished;
+        } else if (!fromApi) {
+          /* 接口完全不可用（连续失败）→ 才退回 DOM。
+           * ⚠️ 2026-10-24 实测：DOM 的 `Response complete` 会**早于文本写完**出现 ✗
+           * （实测只拿到一个 `<tool_call>` 开头）→ 必须再要求「文本稳定 ≥1.2s」。 */
+          const dom = await readDomAnswerState(page);
+          if (dom.text && dom.text !== lastDomText) {
+            lastDomText = dom.text;
+            domChangedAt = Date.now();
+          }
+          if (dom.complete && dom.text && dom.text !== baseline.text) {
+            const stable = Date.now() - domChangedAt >= 1200;
+            usedDom = true;
+            text = dom.text;
+            finished = stable;
+          }
+        }
+
+        if (text.length > emitted.length) {
+          const delta = text.slice(emitted.length);
+          emitted = text;
           lastGrowth = Date.now();
-          yield { content: delta, model: PLATFORM };
+          /* 把安全标记换回真实 `<tool_call>`，解析器/客户端才认得 ✓ */
+          yield { content: restoreToolTags(delta), model: PLATFORM };
         }
 
-        /* **页面说完成**才算完成（`Response complete`）—— 这是 ChatGPT 自己的标记 ✓。 */
-        if (state.complete && emitted.length > 0) {
+        if (finished && emitted.length > 0) {
+          if (process.env['CHATGPT_DUMP_STREAM'] === '1' && sseBodies.length > 0) {
+            try {
+              const { writeFileSync } = await import('node:fs');
+              writeFileSync('/tmp/chatgpt-last-sse.txt', sseBodies.join('\n'), 'utf8');
+              logger.info(`[chatgpt] 已转储原始 SSE: /tmp/chatgpt-last-sse.txt（${sseBodies.join('').length} 字节）`);
+            } catch {
+              // 忽略
+            }
+          }
           if (process.env['CHATGPT_DUMP_STREAM'] === '1') {
             try {
               const { writeFileSync } = await import('node:fs');
@@ -997,12 +1341,28 @@ export class ChatGptBrowserProvider extends BaseProvider {
             }
           }
           logger.info(
-            `[chatgpt] 本轮结束（正文 ${emitted.length} 字符，耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s，页面标记 Response complete）`,
+            `[chatgpt] 本轮结束（正文 ${emitted.length} 字符，耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s，来源 ${usedApi ? '后端接口' : usedDom ? 'DOM' : '?'}）`,
           );
           return;
         }
 
-        /* 兜底：页面长时间没有任何变化（关掉了页面 / 平台卡住）。 */
+        /* ⚠️ **快速失败**：模型明显用自带工具、正文一直没有 → 不必干等 120s。
+         * 抛错让 failover 换平台（deepseek/chatglm 不会这样）。 */
+        if (ownToolsAt > 0 && emitted.length === 0 && Date.now() - ownToolsAt > 45_000) {
+          const snapshotId = await captureFailureSnapshot(
+            page,
+            'chatgpt.stream.own-tools',
+            { model: PLATFORM, accountId: this.accountId, extra: { convId, ownToolsAt } },
+            new Error('模型使用了 ChatGPT 自带的代码解释器，未按协议调用工具'),
+          );
+          logger.error(`[chatgpt] 失败现场已记录（error:${snapshotId}）→ /tmp/chatgpt-failure.png`);
+          throw new PlatformUnavailableError(
+            PLATFORM,
+            '模型使用了 ChatGPT 自带的代码解释器（没有调用我们提供的工具）→ 已换平台重试',
+          );
+        }
+
+        /* 兜底：长时间没有任何新内容 → 有正文就保留，没有就报错（带现场）。 */
         if (Date.now() - lastGrowth > IDLE_TIMEOUT_MS) {
           if (emitted.length > 0) {
             logger.warn(
@@ -1022,13 +1382,17 @@ export class ChatGptBrowserProvider extends BaseProvider {
           const snapshotId = await captureFailureSnapshot(
             page,
             'chatgpt.stream.no-answer',
-            { model: PLATFORM, accountId: this.accountId, extra: { convRequestSeen } },
-            new Error('页面没有渲染出新的助手回复'),
+            {
+              model: PLATFORM,
+              accountId: this.accountId,
+              extra: { convRequestSeen, convId, usedApi },
+            },
+            new Error('后端与页面都没有给出助手回复'),
           );
           logger.error(`[chatgpt] 失败现场已记录（error:${snapshotId}）→ /tmp/chatgpt-failure.png`);
           throw new PlatformUnavailableError(
             PLATFORM,
-            `${IDLE_TIMEOUT_MS / 1000}s 内页面没有渲染出新的助手回复（详见 errors.log）`,
+            `${IDLE_TIMEOUT_MS / 1000}s 内没拿到助手回复（后端接口 + DOM 都为空，详见 errors.log）`,
           );
         }
       }
@@ -1040,6 +1404,7 @@ export class ChatGptBrowserProvider extends BaseProvider {
       throw new PlatformUnavailableError(PLATFORM, '请求超过截止时间（deadline）');
     } finally {
       page.off('request', onRequest as never);
+      page.off('response', onResponse as never);
       /* ⚠️ **在这里记录会话 URL**（2026-10-23 实测）：发送后 URL 变 `/c/<id>` 是异步的，
        * 紧接着读会读到 `/`（`(新对话/首页)`）→ 下轮只能退回完整提示词 ✗。
        * 本轮结束时导航必定已完成 ✓。 */
