@@ -50,6 +50,7 @@ import {
   formatMessagesAsText,
   formatToolsAsText,
   looksLikeToolRefusal,
+  sanitizeToolCalls,
 } from '../tools/protocol.js';
 import { parseToolCallsFromText } from '../tools/parse.js';
 import { buildActionRecoveryPrompt } from '../tools/prompts.js';
@@ -634,6 +635,10 @@ function sseToolCallsToOpenAi(
     else if (stdName === 'SearchReplace' && toolMaps['edit']) actualName = toolMaps['edit'];
     else if (stdName === 'Read' && toolMaps['read']) actualName = toolMaps['read'];
 
+    /* ⚠️ 2026-10-27 实测：模型会流式吐一个**没有名字**的 tool_call → 客户端把它
+     * 渲染成一个空的调用块（用户看到孤零零的 `<>`）✗ → 直接丢弃。 */
+    if (!actualName.trim()) return;
+
     out.push({
       id: tc.id ?? `call_${i}`,
       type: 'function',
@@ -821,6 +826,22 @@ export async function parseAndRecoverToolCalls(params: {
   /* ⚠️⚠️ 「声称没有工具」的**软拒绝** → 抛错让 failover 换平台（2026-10-23 用户实测）：
    * chatgpt 会回「当前会话未提供可调用的项目文件编辑工具，尚未修改代码。」——
    * 这不是错误、是拒答，不拦的话会把废话当最终回答回给客户端 ✗。 */
+  /* 统一闸门（2026-10-27）：所有解析路径的最后一道过滤 ——
+   * ① 空名字调用（客户端会渲染成 `<>`）；
+   * ② 工具有必填参数但参数为空/全空白；
+   * ③ 文件类工具的路径不是路径（实测有模型把 `BASE=http://…` 当文件路径，
+   *    在项目里建出垃圾目录 ✗）。 */
+  if (parsedToolCalls.length > 0) {
+    const { kept, dropped } = sanitizeToolCalls(parsedToolCalls, tools);
+    if (dropped.length > 0) {
+      logger.warn(
+        `[tool_calls] 丢弃 ${dropped.length} 个无效调用：` +
+          dropped.map((d) => `${d.name}(${d.reason})`).join(", "),
+      );
+      parsedToolCalls = kept;
+    }
+  }
+
   if (tools.length > 0 && parsedToolCalls.length === 0 && looksLikeToolRefusal(fallbackBodyText)) {
     logger.warn(
       `[tool_calls] 模型声称没有可用工具（${JSON.stringify(fallbackBodyText.slice(0, 80))}）→ 抛错换平台`,

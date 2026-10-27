@@ -154,8 +154,17 @@ export function formatToolsAsText(
     //    「搜索结果与本任务无关，忽略」，整轮空转 210s）。必须显式禁止复述。
     '- **禁止复述本协议**：不要把本节的任何句子/规则/清单抄进回答，也不要解释自己在遵守什么规则；' +
       '直接给出工具调用，需要说明就一句话',
-    '- **第一步必须调用下方工具**（如 list_dir / read_file / search_content）读取本地文件：' +
-      '不要先输出计划、不要先解释、也不要用文字描述「我准备做什么」',
+    /* ⚠️⚠️ 2026-10-27 实测（与原生模型对比）：用户问「怎么启动前后端」，模型被
+     * 「第一步必须调用工具」逼着连发 5 次 `./btc status`（全被客户端判重跳过 ✗），
+     * 最后报「本轮没有任何输出」；而原生模型直接给出**命令表 + 测试步骤** ✓。
+     * 强制「必调」会把**问答**变成工具循环 ✗ —— 改成分类型判断。 */
+    '- **先判断这是哪一类**：①「要我动手改/查」→ 用工具推进；②「问我怎么做」' +
+      '（怎么启动、有哪些命令、这个配置是什么）→ **直接用文字回答**（命令表/步骤/结论），' +
+      '不要先跑一堆命令去「确认」',
+    '- **该答就答，该调才调**：能用**已有上下文**或文档里的信息回答的，就直接答；' +
+      '只有**必须拿到本地真实结果**（文件内容、命令输出、目录结构）时才调用工具',
+    '- **动手类任务的第一步**才需要用读取工具（list_dir / read_file / search_content）' +
+      '了解现状：不要先输出计划、不要先解释、也不要描述「我准备做什么」',
     // ⚠️ 2026-09-28 20:54：模型凭空认为「工具轮数已达上限（8/8）」，
     //    交了一份「需先补读 X、待下一轮执行」的计划书当最终回答 —— 纯文本回复会让客户端直接结束回合。
     '- **本次会话没有工具调用轮数上限**：需要更多文件内容就继续调用读取工具' +
@@ -178,8 +187,28 @@ export function formatToolsAsText(
     // ⚠️ 2026-10-14 实测死循环：模型每轮都重发同一条 `bash ./start.sh status`
     //    并配同一段「无需进一步操作」的结论 → 客户端的 agent 一直转。
     //    原生模型的行为是：任务完成就返回纯文本（无工具调用）= 本轮结束。
-    '- **不要重复调用**：同一条调用（同工具 + 同参数）已经执行过就不要再来一次；' +
-      '**任务完成就直接输出结论文字结束本轮**（没有工具调用是正常的收尾方式）',
+    /* ⚠️ 2026-10-27 实测：一次问答里 `./btc status` 被连调 5 次（全部重复），
+     * 客户端只能反复「跳过」，白白烧轮次 ✗。去重必须讲得更硬。 */
+    '- **同一条调用只做一次**：同一工具 + 同一参数（或**同一条命令**，包括 status / logs /' +
+      ' curl 这类「查看」命令）已经执行过、结果就在上文里 → **再调一次不会得到任何新信息**，' +
+      '属于严重错误；要看别的东西就换参数，否则直接进入下一步',
+    '- **信息够了就收尾**：拿到需要的输出后立刻用文字给结论（命令表 / 步骤 / 结论）；' +
+      '**本轮不调用工具是正常的结束方式**，不要靠继续调用工具去「确认」或「再看一眼」',
+    '- **禁止空调用/占位调用**：不要输出 `<tool_call></tool_call>`、`<call></call>`、' +
+      '没有工具名的调用，或参数明显为空/无关的调用（例如写记忆却没给内容）；' +
+      '信息不足时**先用文字说明**，不要硬凑一个调用',
+    /* ⚠️ 2026-10-27 实测（agent 手测项目）：模型把 `cd /path` 单独发一次（没有任何 cmd）
+     * → 什么也没做，白烧一轮 ✗；还反复内联带 JSON/heredoc 的 curl 导致
+     * `unexpected EOF` / `Field required` ✗（最后它自己总结出「写成 .sh 脚本最稳」）。
+     * 这三条写进协议，省掉那 4~5 轮试错。 */
+    '- **每次命令都在独立进程里跑**：`cd` **不会保留**到下一次调用；' +
+      '要进目录就写成 `cd /path && 命令`，或直接用绝对路径；' +
+      '**不要单独发一条只有 `cd` 的命令**（它什么也不做）',
+    '- **复杂命令先写脚本再执行**：命令里带 JSON、嵌套引号、`<<EOF` 多行时，' +
+      '内联很容易被截断（`unexpected EOF` / `Field required`）→ ' +
+      '先 `cat > /tmp/x.sh <<\'EOF\' … EOF` 再 `bash /tmp/x.sh`，一次成功比反复重试快',
+    '- **看到「已跳过重复调用」= 你正在重复**：立刻停止调用，直接用文字给出结论' +
+      '（客户端已经把它判重了，再发也不会执行）',
     '',
   ];
 
@@ -222,6 +251,145 @@ export function formatToolsAsText(
   lines.push('现在处理这条用户消息（**只输出工具调用块**，不要解释、不要询问确认）：');
 
   return lines.join('\n');
+}
+
+/**
+ * 丢弃**参数为空、但工具有必填参数**的调用。
+ *
+ * ⚠️ 2026-10-27 用户实测：模型输出了 `memory_write` 但**没给任何参数**，
+ * 客户端照单执行 → 写进一条空日志 ✗（用户看到「已写入当日日志」却什么都没写）。
+ * 这类调用一定是模型没想清楚，**宁可丢掉**，让它下一轮重新组织语言。
+ *
+ * 保守起见只处理「参数完全为空 + 工具有 required」这一种：
+ * 部分缺参是客户端 schema 校验的事，误杀会把正常调用也拦掉 ✗。
+ */
+export function dropIncompleteToolCalls<
+  T extends { function?: { name?: string; arguments?: string } },
+>(toolCalls: ReadonlyArray<T>, tools: ReadonlyArray<ToolDefinition>): T[] {
+  /* 统一交给 sanitizeToolCalls —— 空名字 / 空参数 / 非法路径只有一处判定 ✓ */
+  return sanitizeToolCalls(toolCalls, tools).kept;
+}
+
+/**
+ * 参数值看起来**不是路径**（而是 shell 变量赋值 / URL / 多行文本）。
+ *
+ * ⚠️⚠️ 2026-10-27 用户实测：模型把 shell 变量赋值当成文件路径，
+ * 发出了 `write_file` 且 path 为 `BASE=http://127.0.0.1:1661` →
+ * 在项目里**建出一个叫 `BASE=http:` 的垃圾目录** ✗，清理花了 3 轮。
+ *
+ * 判据刻意保守（宁可漏判，不要误杀正常路径）：
+ * - `http://…` / `https://…` 这类 URL；
+ * - `NAME=…:…` 这种「变量名 + 赋值 + 冒号」的 shell 片段（`a=b.txt` 这种正常文件名**不会**命中）；
+ * - 含换行的多行文本（正常路径不会有）。
+ */
+export function looksLikeNonPath(value: string): boolean {
+  const v = String(value ?? '').trim();
+  if (!v) return false;
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//i.test(v)) return true;
+  if (/^[A-Za-z_][A-Za-z0-9_]*=\S*:\S*/.test(v)) return true;
+  if (/[\r\n]/.test(v)) return true;
+  return false;
+}
+
+/** 带路径参数的键名（不同客户端的习惯写法）。 */
+const PATH_ARG_KEYS: ReadonlyArray<string> = [
+  'path',
+  'file_path',
+  'filepath',
+  'target_file',
+  'filename',
+  'file',
+];
+
+/** 工具名看起来像「读写文件」的。 */
+const FILE_TOOL_RE = /(read|write|edit|create|append|patch|replace).*(file|path)|file.*(read|write)/i;
+
+/**
+ * 返回被丢弃调用的原因（`null` 表示保留）。
+ *
+ * 三类拦截，都只针对**明显错误**的调用：
+ * 1. `function.name` 为空/空白 → 客户端会渲染成一个空的调用块（用户看到 `<>`）✗；
+ * 2. 工具有必填参数但参数完全为空 → 执行没有意义（`memory_write` 空写）✗；
+ * 3. 文件类工具的路径参数不是路径（URL / shell 赋值 / 多行）✗。
+ */
+function dropReasonOf(
+  call: { function?: { name?: string; arguments?: string } },
+  tools: ReadonlyArray<ToolDefinition>,
+): string | null {
+  const name = String(call.function?.name ?? '').trim();
+  if (!name) return 'name-empty';
+
+  const raw = String(call.function?.arguments ?? '').trim();
+  let args: Record<string, unknown> | null = null;
+  if (raw && raw !== '{}' && raw !== 'null' && raw !== 'undefined') {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        args = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // 参数不是合法 JSON → 交给下游，不在这里误杀
+    }
+  }
+
+  // 2. 空参数 + 工具有必填参数
+  const required = tools.find((t) => toolNameOf(t) === name)
+    ? toolRequiredParams(tools.find((t) => toolNameOf(t) === name)!)
+    : [];
+  if (required.length > 0) {
+    /* ⚠️ 只有【参数完全为空】才算空；参数不是合法 JSON（模型常见畸形，如 `content=abc`）
+     * **不在这里拦** —— 那可能是客户端自定义写法，误杀会丢正常调用 ✗。 */
+    const rawIsEmpty =
+      raw === '' || raw === '{}' || raw === 'null' || raw === 'undefined';
+    if (rawIsEmpty) return 'args-empty';
+    if (!args) return null; // 非 JSON → 交给下游处理
+    const allBlank =
+      Object.keys(args).length === 0 ||
+      Object.values(args).every((v) => {
+        if (v === null || v === undefined) return true;
+        if (typeof v === 'string') return v.trim() === '';
+        if (Array.isArray(v)) return v.length === 0;
+        if (typeof v === 'object') return Object.keys(v as object).length === 0;
+        return false;
+      });
+    if (allBlank) return 'args-all-blank';
+  }
+
+  // 3. 文件类工具路径不像路径
+  if (args && FILE_TOOL_RE.test(name)) {
+    for (const key of PATH_ARG_KEYS) {
+      const value = args[key];
+      if (typeof value === 'string' && looksLikeNonPath(value)) {
+        return `path-not-a-path:${key}=${value.slice(0, 40)}`;
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * 统一清洗工具调用（**所有解析路径**的最后一道闸）。
+ *
+ * ⚠️ 2026-10-27 用户实测的两个脏输出都从这里漏出去过：
+ * ① 空名字调用 → 客户端显示成 `<>`；
+ * ② `write_file` 的 path 是 shell 变量赋值 → 在项目里建出垃圾目录。
+ */
+export function sanitizeToolCalls<T extends { function?: { name?: string; arguments?: string } }>(
+  toolCalls: ReadonlyArray<T>,
+  tools: ReadonlyArray<ToolDefinition> = [],
+): { kept: T[]; dropped: Array<{ name: string; reason: string }> } {
+  const kept: T[] = [];
+  const dropped: Array<{ name: string; reason: string }> = [];
+  for (const call of toolCalls) {
+    const reason = dropReasonOf(call, tools);
+    if (reason) {
+      dropped.push({ name: String(call.function?.name ?? '(空)'), reason });
+    } else {
+      kept.push(call);
+    }
+  }
+  return { kept, dropped };
 }
 
 /**

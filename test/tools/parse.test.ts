@@ -406,3 +406,30 @@ describe('parseToolCallsFromText — 未闭合的 DSML（模型只写了个开�
     expect(out.text).toBe('我先看看目录');
   });
 });
+
+/**
+ * ⭐ 2026-10-27 用户实测（与原生模型对比）：agent 调用我们包装的模型时，
+ * 输出里出现了孤零零的 `<call></call>`（空容器）✗ —— 解析器的 7 层 Pattern 只认
+ * `<tool_call>`，所以它被当成正文漏给了客户端。
+ */
+describe('parseToolCallsFromText — `<call>` 别名与空调用', () => {
+  it('⭐ `<call>{...}</call>` 当作工具调用解析（别再漏成正文）', () => {
+    const r = parseToolCallsFromText('<call>{"name":"read_file","arguments":{"path":"/a"}}</call>');
+    expect(r.toolCalls).toHaveLength(1);
+    expect(r.toolCalls[0]?.function.name).toBe('read_file');
+    expect(r.text).not.toContain('<call>');
+  });
+
+  it('⭐ 空的 `<call></call>` 要从正文里清掉（否则用户会看到它）', () => {
+    const r = parseToolCallsFromText('好的\n<call>\n\n</call>\n继续');
+    expect(r.toolCalls).toHaveLength(0);
+    expect(r.text).not.toContain('call');
+    expect(r.text).toContain('好的');
+  });
+
+  it('空的 `<tool_call></tool_call>` 同样清掉', () => {
+    const r = parseToolCallsFromText('前文<tool_call></tool_call>后文');
+    expect(r.toolCalls).toHaveLength(0);
+    expect(r.text).not.toContain('tool_call');
+  });
+});

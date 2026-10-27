@@ -47,6 +47,12 @@ export function normalizeToolCallTags(text: string): string {
   out = out.replace(/<t\s*\n\s*ool_call\s*>/g, '<tool_call>');
   out = out.replace(/<tool\s*\n\s*_call\s*>/g, '<tool_call>');
 
+  /* ⚠️ 2026-10-27 实测：模型有时用 `<call>…</call>` 当容器（不是我们的 `<tool_call>`）→
+   * 解析器 7 层 Pattern 全不认 ✗ → 它被当成正文漏给客户端（用户看到孤零零的 `<call></call>`）。
+   * 在归一化阶段当别名处理，后续所有 Pattern 都能复用 ✓。 */
+  out = out.replace(/<call\s*>/gi, '<tool_call>');
+  out = out.replace(/<\/call\s*>/gi, '</tool_call>');
+
   return out;
 }
 
@@ -63,11 +69,11 @@ export function stripLeftoverToolTags(text: string): string {
 
   // 1) 成对的空标签块（中间只有空白）
   out = out.replace(
-    /<\s*\/?\s*(?:t+ool_call)\s*>\s*<\s*\/?\s*(?:t+ool_call)\s*>/gi,
+    /<\s*\/?\s*(?:t+ool_call|call)\s*>\s*<\s*\/?\s*(?:t+ool_call|call)\s*>/gi,
     '',
   );
   // 2) 任意残留的单个标签
-  out = out.replace(/<\s*\/?\s*t+ool_call\s*>/gi, '');
+  out = out.replace(/<\s*\/?\s*(?:t+ool_call|call)\s*>/gi, '');
   // 3) 粘连写法（缺少开头 "<" / 结尾 ">"）
   out = out.replace(/(?<![<\w])t+ool_call\s*>/g, '');
   out = out.replace(/<\s*\/?\s*t+ool_call(?![>\w])/gi, '');

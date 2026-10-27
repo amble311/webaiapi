@@ -185,6 +185,10 @@ export async function* streamWithFailover(
         });
 
         let emptyError: string | null = null;
+        /* ⚠️ 2026-10-27 实测：provider **零产出**（一个 chunk 都没有、也没报错）时，
+         * 原来会被当成「成功返回空」→ 客户端只看到「本轮没有任何输出」✗。
+         * 现在记为失败并切下一个平台 ✓。 */
+        let emittedContent = false;
 
         // ⚠️ `for await` 在 break/throw/return 时都会调用生成器的 return()
         //    → provider 的 finally 释放串行锁。不要改成手动 next()。
@@ -195,11 +199,19 @@ export async function* streamWithFailover(
             break;
           }
           started = true;
+          if ((chunk.content ?? '').trim()) emittedContent = true;
           yield [chunk, platform];
         }
 
         if (emptyError !== null) {
           throw new PlatformUnavailableError(platform, `返回空内容: ${emptyError}`);
+        }
+
+        if (!emittedContent) {
+          throw new PlatformUnavailableError(
+            platform,
+            '本轮没有任何输出（限流 / 页面结构变化 / 空回复）',
+          );
         }
 
         return; // 成功完成
@@ -304,6 +316,14 @@ export async function* streamWithFailover(
       if (emptyError !== null) {
         // 让上层把真实原因返回给客户端，避免「空回复 + 无任何说明」
         throw new PlatformUnavailableError(activePlatform, `返回空内容: ${emptyError}`);
+      }
+      /* ⚠️ 2026-10-27：零产出同样是失败 —— 静默返回空会让客户端只能说
+       * 「本轮没有任何输出」，既没有原因也不能自动换账号 ✗ */
+      if (!emitted) {
+        throw new PlatformUnavailableError(
+          activePlatform,
+          '本轮没有任何输出（限流 / 页面结构变化 / 空回复）',
+        );
       }
       return;
     } catch (error) {

@@ -6,6 +6,9 @@ import {
   buildToolProtocol,
   formatMessagesAsText,
   buildToolTailReminder,
+  dropIncompleteToolCalls,
+  sanitizeToolCalls,
+  looksLikeNonPath,
   looksLikeToolRefusal,
   formatToolsAsText,
 } from '../../src/tools/protocol.js';
@@ -63,10 +66,13 @@ describe('formatToolsAsText', () => {
     expect(text).toContain('"name": "工具名", "arguments": {"参数名": "参数值"}');
   });
 
-  it('⚠️ 必须显式声明「禁止联网搜索」「第一步必须调用工具」「工具数量」', () => {
+  /* ⚠️ 2026-10-27 改：「第一步必须调用工具」这条被删掉了 ——
+   * 它会把「问我怎么做」的问答逼成工具循环（连发 5 次 status ✗）。
+   * 现在改为「该答就答，该调才调」，具体断言见文件末尾的「不做工具循环」一节。 */
+  it('⚠️ 必须显式声明「禁止联网搜索」「动手类先读取」「工具数量」', () => {
     const text = formatToolsAsText(TOOLS);
     expect(text).toContain('不要联网搜索，命令语法也别搜');
-    expect(text).toContain('第一步必须调用下方工具');
+    expect(text).toContain('动手类任务的第一步');
     expect(text).toContain(`本次对话可用的工具只有下方列出的这 ${TOOLS.length} 个`);
     expect(text).toContain('忽略运行环境自带的其他工具');
   });
@@ -382,5 +388,179 @@ describe('问句也要先调工具（2026-10-24 实测）', () => {
         '当前环境中未能读取到 /home/amble/object/xzh 项目文件，因此暂时无法准确判断前端的目录结构、技术栈和页面组织方式。',
       ),
     ).toBe(true);
+  });
+});
+
+/**
+ * ⭐ 2026-10-27 用户实测：问「怎么启动前后端」，模型被「第一步必须调用工具」逼着
+ * 连发 5 次 `./btc status`（全被客户端判重跳过 ✗），最后报「本轮没有任何输出」；
+ * 而原生模型直接给命令表 ✓。协议必须「分类型」并**硬性去重**。
+ */
+describe('工具协议 —— 不做工具循环（2026-10-27 实测）', () => {
+  const tools = [
+    { type: 'function' as const, function: { name: 'bash', description: '执行命令', parameters: { type: 'object', properties: { command: { type: 'string' } } } } },
+  ];
+
+  it('⭐ 区分「动手改/查」与「问我怎么做」：后者直接文字回答', () => {
+    const text = formatToolsAsText(tools);
+    expect(text).toContain('该答就答，该调才调');
+    expect(text).toContain('问我怎么做');
+    // 旧的「第一步必须调用工具」这种无差别强制必须消失
+    expect(text).not.toContain('第一步必须调用下方工具');
+  });
+
+  it('⭐ 同一条调用只能做一次，并明确「信息够了就收尾」', () => {
+    const text = formatToolsAsText(tools);
+    expect(text).toContain('同一条调用只做一次');
+    expect(text).toContain('信息够了就收尾');
+    expect(text).toContain('本轮不调用工具是正常的结束方式');
+  });
+
+  it('⭐ 明确禁止空调用/占位调用', () => {
+    const text = formatToolsAsText(tools);
+    expect(text).toContain('禁止空调用');
+    expect(text).toContain('<call></call>');
+  });
+});
+
+/**
+ * ⭐ 2026-10-27 实测：模型输出 `memory_write` 却**没给任何参数**，客户端照单执行
+ * → 写进一条空日志（用户看到「已写入当日日志」但内容为空）✗。
+ * 这类「参数完全为空 + 工具有必填参数」的调用一律丢弃。
+ */
+describe('dropIncompleteToolCalls（丢弃空参数调用）', () => {
+  const tools = [
+    { type: 'function' as const, function: { name: 'memory_write', description: '写记忆', parameters: { type: 'object', properties: { content: { type: 'string' } }, required: ['content'] } } },
+    { type: 'function' as const, function: { name: 'list_dir', description: '列目录', parameters: { type: 'object', properties: { target_directory: { type: 'string' } }, required: [] } } },
+  ];
+  const call = (name: string, args: string) => ({ function: { name, arguments: args } });
+
+  it('⭐ 有必填参数却传空参数 → 丢掉', () => {
+    const kept = dropIncompleteToolCalls([call('memory_write', ''), call('memory_write', '{}')], tools);
+    expect(kept).toHaveLength(0);
+  });
+
+  it('正常调用 / 无必填参数的调用 → 保留', () => {
+    const kept = dropIncompleteToolCalls(
+      [call('memory_write', '{"content":"x"}'), call('list_dir', '')],
+      tools,
+    );
+    expect(kept).toHaveLength(2);
+  });
+
+  it('未知工具名 → 保留（交给客户端判断，不误杀）', () => {
+    expect(dropIncompleteToolCalls([call('whatever', '')], tools)).toHaveLength(1);
+  });
+});
+
+/**
+ * ⭐ 2026-10-27 实测（agent 手测项目）：模型单独发 `cd /path`（什么也没做）、
+ * 反复内联带 JSON/heredoc 的 curl（unexpected EOF）、以及明知「已跳过重复调用」还继续发。
+ * 这三条直接写进协议，省掉 4~5 轮试错。
+ */
+describe('工具协议 —— 命令构造与去重（2026-10-27 实测）', () => {
+  const tools = [
+    { type: 'function' as const, function: { name: 'bash', description: '执行命令', parameters: { type: 'object', properties: { command: { type: 'string' } } } } },
+  ];
+
+  it('⭐ 声明「每次命令都是独立进程，cd 不保留」', () => {
+    const text = formatToolsAsText(tools);
+    expect(text).toContain('每次命令都在独立进程里跑');
+    expect(text).toContain('cd /path && 命令');
+    expect(text).toContain('不要单独发一条只有 `cd` 的命令');
+  });
+
+  it('⭐ 复杂命令先写脚本（避免引号/heredoc 被打断）', () => {
+    const text = formatToolsAsText(tools);
+    expect(text).toContain('复杂命令先写脚本再执行');
+    expect(text).toContain('unexpected EOF');
+  });
+
+  it('⭐ 看到「已跳过重复调用」就该收尾', () => {
+    const text = formatToolsAsText(tools);
+    expect(text).toContain('已跳过重复调用');
+  });
+});
+
+/**
+ * ⭐ 2026-10-27：模型也会给出「看起来有参数、其实全是空白」的调用
+ * （例如 `{"content":"  "}`）→ 同样没意义，应一并丢弃。
+ */
+describe('dropIncompleteToolCalls —— 所有参数值全空白', () => {
+  const tools = [
+    { type: 'function' as const, function: { name: 'memory_write', description: '写记忆', parameters: { type: 'object', properties: { content: { type: 'string' } }, required: ['content'] } } },
+  ];
+  const call = (args: string) => ({ function: { name: 'memory_write', arguments: args } });
+
+  it('⭐ `{"content":"  "}` 丢弃', () => {
+    expect(dropIncompleteToolCalls([call('{"content":"  "}')], tools)).toHaveLength(0);
+  });
+
+  it('有真实内容 → 保留', () => {
+    expect(dropIncompleteToolCalls([call('{"content":"今天修了 X"}')], tools)).toHaveLength(1);
+  });
+
+  it('参数不是 JSON（模型常见畸形）→ 保留，交给下游', () => {
+    expect(dropIncompleteToolCalls([call('content=abc')], tools)).toHaveLength(1);
+  });
+});
+
+/**
+ * ⭐⭐ 2026-10-27 用户实测的两个脏输出：
+ * ① 空名字调用 → 客户端渲染成 `<>`（用户看到两个空块）；
+ * ② 模型把 shell 变量赋值当文件路径：`write_file` 的 path 是 `BASE=http://127.0.0.1:1661`
+ *    → 在项目里**建出叫 `BASE=http:` 的垃圾目录** ✗，清理花了 3 轮。
+ */
+describe('sanitizeToolCalls（统一闸门）', () => {
+  const tools = [
+    {
+      type: 'function' as const,
+      function: {
+        name: 'write_file',
+        description: '写文件',
+        parameters: {
+          type: 'object',
+          properties: { path: { type: 'string' }, content: { type: 'string' } },
+          required: ['path', 'content'],
+        },
+      },
+    },
+    {
+      type: 'function' as const,
+      function: {
+        name: 'memory_write',
+        description: '写记忆',
+        parameters: { type: 'object', properties: { content: { type: 'string' } }, required: ['content'] },
+      },
+    },
+  ];
+  const call = (name: string, args: string) => ({ function: { name, arguments: args } });
+
+  it('⭐ 空名字调用被丢掉（客户端就不会显示 `<>`）', () => {
+    const r = sanitizeToolCalls([call('', '{}'), call('   ', '{"a":1}')], tools);
+    expect(r.kept).toHaveLength(0);
+    expect(r.dropped.every((d) => d.reason === 'name-empty')).toBe(true);
+  });
+
+  it('⭐ shell 变量赋值当路径 → 丢掉（防止建出 `BASE=http:` 目录）', () => {
+    const bad = call('write_file', JSON.stringify({ path: 'BASE=http://127.0.0.1:1661', content: 'x' }));
+    const r = sanitizeToolCalls([bad], tools);
+    expect(r.kept).toHaveLength(0);
+    expect(r.dropped[0]?.reason).toContain('path-not-a-path');
+  });
+
+  it('正常文件路径 / 正常参数 → 保留', () => {
+    const ok = call('write_file', JSON.stringify({ path: '/home/a/b.txt', content: 'hi' }));
+    const ok2 = call('memory_write', JSON.stringify({ content: '今天修了 X' }));
+    expect(sanitizeToolCalls([ok, ok2], tools).kept).toHaveLength(2);
+  });
+
+  it('looksLikeNonPath：只认明显不是路径的形态（不误杀 a=b.txt）', () => {
+    expect(looksLikeNonPath('BASE=http://127.0.0.1:1661')).toBe(true);
+    expect(looksLikeNonPath('http://x/y')).toBe(true);
+    expect(looksLikeNonPath('a\nb')).toBe(true);
+    expect(looksLikeNonPath('/home/a/b.txt')).toBe(false);
+    expect(looksLikeNonPath('a=b.txt')).toBe(false);
+    expect(looksLikeNonPath('src/index.ts')).toBe(false);
   });
 });
